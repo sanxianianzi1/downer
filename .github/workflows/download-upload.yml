@@ -1,0 +1,201 @@
+name: Download and upload to tgstate
+
+on:
+  repository_dispatch:
+    types: [download-task]
+
+permissions: {}
+
+concurrency:
+  group: download-task
+  cancel-in-progress: false
+
+env:
+  # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
+  MAX_FILESIZE_GB: "10"
+  GOPEED_CONNECTIONS: "16"
+  GOPEED_VERSION: "v1.9.3"
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Validate link
+        id: prep
+        env:
+          PAYLOAD_URL: ${{ github.event.client_payload.url }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          from urllib.parse import urlparse
+
+          raw = os.environ["PAYLOAD_URL"].strip()
+          p = urlparse(raw)
+          allowed = {"http", "https", "magnet", "ed2k"}
+          if p.scheme not in allowed:
+              sys.stderr.write("::error::链接校验失败，仅支持 http/https/magnet/ed2k\n")
+              sys.exit(1)
+          if p.scheme in ("http", "https") and not p.netloc:
+              sys.stderr.write("::error::http/https 链接缺少主机名\n")
+              sys.exit(1)
+          if p.scheme in ("magnet", "ed2k") and not raw[len(p.scheme) + 1 :].lstrip("/"):
+              sys.stderr.write("::error::magnet/ed2k 链接内容为空\n")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("url<<GOPEED_URL_EOF\n")
+              f.write(raw + "\n")
+              f.write("GOPEED_URL_EOF\n")
+              f.write(f"scheme={p.scheme}\n")
+          PY
+          echo "chat_id=$CHAT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Cache Gopeed CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/gopeed
+          key: gopeed-${{ env.GOPEED_VERSION }}-${{ runner.os }}-amd64
+
+      - name: Install Gopeed CLI
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/go/bin/gopeed" ]; then
+            CGO_ENABLED=0 go install "github.com/GopeedLab/gopeed/cmd/gopeed@${GOPEED_VERSION}"
+          fi
+          gopeed -h
+
+      - name: Download with Gopeed
+        id: download
+        env:
+          DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          max_bytes=$((MAX_FILESIZE_GB * 1024 * 1024 * 1024))
+
+          gopeed -C "$GOPEED_CONNECTIONS" -D "$PWD/work" "$DOWNLOAD_URL"
+
+          mapfile -t files < <(find work -type f -printf '%s\t%p\n' | sort -nr)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Gopeed 完成后 work/ 目录为空"
+            exit 1
+          fi
+
+          total=0
+          while IFS=$'\t' read -r sz _; do
+            total=$((total + sz))
+          done < <(printf '%s\n' "${files[@]}")
+
+          if [ "$total" -gt "$max_bytes" ]; then
+            echo "::error::文件合计超过 ${MAX_FILESIZE_GB}GB 上限（${total} 字节）"
+            exit 1
+          fi
+
+          if [ "${#files[@]}" -eq 1 ]; then
+            IFS=$'\t' read -r actual path <<< "${files[0]}"
+            name=$(basename "$path")
+          else
+            name="download.zip"
+            path="bundle.zip"
+            python3 - <<'PY'
+          import os, zipfile
+          with zipfile.ZipFile("bundle.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, _, names in os.walk("work"):
+                  for n in names:
+                      full = os.path.join(root, n)
+                      zf.write(full, os.path.relpath(full, "work"))
+          PY
+            actual=$(stat -c %s "$path")
+            if [ "$actual" -gt "$max_bytes" ]; then
+              echo "::error::打包后超过 ${MAX_FILESIZE_GB}GB 上限"
+              exit 1
+            fi
+          fi
+
+          safe=$(python3 - "$name" <<'PY'
+          import sys
+          name = sys.argv[1]
+          safe = "".join(c if (c.isalnum() or c in "._- ") else "_" for c in name)
+          safe = safe.strip("._") or "download.bin"
+          print(safe[-150:] if len(safe) > 150 else safe)
+          PY
+          )
+
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "filename=$safe" >> "$GITHUB_OUTPUT"
+          echo "size=$actual" >> "$GITHUB_OUTPUT"
+          echo "下载完成：$safe ($actual 字节，共 ${#files[@]} 个文件)"
+
+      - name: Upload to tgstate
+        id: upload
+        env:
+          TGSTATE_URL: ${{ secrets.TGSTATE_URL }}
+          TGSTATE_PASSWORD: ${{ secrets.TGSTATE_PASSWORD }}
+          FILE_PATH: ${{ steps.download.outputs.path }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+        run: |
+          set -euo pipefail
+          base="${TGSTATE_URL%/}"
+
+          curl -fsS -c cookies.txt \
+            -H "Content-Type: application/json" \
+            -H "Origin: $base" \
+            -d "$(jq -n --arg p "$TGSTATE_PASSWORD" '{password: $p}')" \
+            "$base/api/auth/login" | jq -e '.status == "ok"' > /dev/null
+
+          upload_resp=$(curl -fsS -b cookies.txt \
+            -H "Origin: $base" \
+            -F "file=@${FILE_PATH};filename=${FILENAME}" \
+            "$base/api/upload")
+
+          short_id=$(echo "$upload_resp" | jq -er '.short_id')
+          share_url="$base/d/$short_id"
+          echo "share_url=$share_url" >> "$GITHUB_OUTPUT"
+          echo "上传完成：$share_url"
+
+      - name: Send result to Telegram
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ steps.prep.outputs.chat_id }}
+          SHARE_URL: ${{ steps.upload.outputs.share_url }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+          SIZE: ${{ steps.download.outputs.size }}
+        run: |
+          set -euo pipefail
+          size_mb=$((SIZE / 1024 / 1024))
+          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\n链接: %s' "$FILENAME" "$size_mb" "$SHARE_URL")
+          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}" > /dev/null
+
+      - name: Send failure to Telegram
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CHAT_ID" ]; then
+            echo "::warning::缺少 chat_id，无法发送失败通知"
+            exit 0
+          fi
+          link_part=""
+          if [ -n "$DOWNLOAD_URL" ]; then
+            link_part=$'\n'"链接: ${DOWNLOAD_URL}"
+          fi
+          text=$(printf '[FAIL] 任务失败，查看日志: %s%s' "$RUN_URL" "$link_part")
+          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}" > /dev/null || true
