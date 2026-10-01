@@ -1,0 +1,329 @@
+name: Download, rclone copy, and upload to tgstate
+
+on:
+  repository_dispatch:
+    types: [download-task]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '下载链接（http/https/magnet/ed2k）'
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: download-task
+  cancel-in-progress: false
+
+env:
+  # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
+  MAX_FILESIZE_GB: "10"
+  GOPEED_CONNECTIONS: "16"
+  GOPEED_VERSION: "v1.9.3"
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Validate link
+        id: prep
+        env:
+          PAYLOAD_URL: ${{ github.event.client_payload.url || inputs.url }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          from urllib.parse import urlparse
+
+          raw = os.environ["PAYLOAD_URL"].strip()
+          p = urlparse(raw)
+          allowed = {"http", "https", "magnet", "ed2k"}
+          if p.scheme not in allowed:
+              sys.stderr.write("::error::链接校验失败，仅支持 http/https/magnet/ed2k\n")
+              sys.exit(1)
+          if p.scheme in ("http", "https") and not p.netloc:
+              sys.stderr.write("::error::http/https 链接缺少主机名\n")
+              sys.exit(1)
+          if p.scheme in ("magnet", "ed2k") and not raw[len(p.scheme) + 1 :].lstrip("/"):
+              sys.stderr.write("::error::magnet/ed2k 链接内容为空\n")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("url<<GOPEED_URL_EOF\n")
+              f.write(raw + "\n")
+              f.write("GOPEED_URL_EOF\n")
+              f.write(f"scheme={p.scheme}\n")
+          PY
+          echo "chat_id=$CHAT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Install Gopeed Web
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o gopeed-web.zip \
+            "https://github.com/GopeedLab/gopeed/releases/download/${GOPEED_VERSION}/gopeed-web-${GOPEED_VERSION}-linux-amd64.zip"
+          unzip -q gopeed-web.zip
+          chmod +x "gopeed-web-${GOPEED_VERSION}-linux-amd64/gopeed"
+
+      - name: Download with Gopeed
+        id: download
+        env:
+          DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
+          DOWNLOAD_SCHEME: ${{ steps.prep.outputs.scheme }}
+          GOPEED_COOKIE: ${{ secrets.GOPEED_COOKIE }}
+          GOPEED_HEADERS: ${{ secrets.GOPEED_HEADERS }}
+        run: |
+          set -euo pipefail
+
+          # 直链预检：创建 Gopeed 任务前先探测链接可用性，412 通常是 Cookie 无效或过期
+          if [ "$DOWNLOAD_SCHEME" = "http" ] || [ "$DOWNLOAD_SCHEME" = "https" ]; then
+            code=$(curl -sS -L -o /dev/null --max-time 15 -r 0-1023 -w '%{http_code}' \
+              -H "Cookie: $GOPEED_COOKIE" "$DOWNLOAD_URL" || true)
+            case "$code" in
+              200|206|416)
+                echo "直链预检通过（HTTP $code）"
+                ;;
+              412)
+                echo "::error::直链预检失败：HTTP 412，通常是夸克 Cookie 无效或过期，请更新 Secret GOPEED_COOKIE"
+                exit 1
+                ;;
+              *)
+                echo "::error::直链预检失败：HTTP $code（链接可能已过期，或需要配置 GOPEED_HEADERS）"
+                exit 1
+                ;;
+            esac
+          fi
+
+          mkdir -p work
+          max_bytes=$((MAX_FILESIZE_GB * 1024 * 1024 * 1024))
+
+          dir="gopeed-web-${GOPEED_VERSION}-linux-amd64"
+          "$dir/gopeed" -A 127.0.0.1 -P 9999 -d "$PWD/.gopeed-storage" &
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9999/api/v1/info > /dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::Gopeed 服务启动失败"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          task_body=$(python3 - "$DOWNLOAD_URL" "$DOWNLOAD_SCHEME" <<'PY'
+          import json, os, sys
+
+          url, scheme = sys.argv[1], sys.argv[2]
+          req = {"url": url}
+          if scheme in ("http", "https"):
+              headers = {}
+              for line in os.environ.get("GOPEED_HEADERS", "").splitlines():
+                  name, sep, value = line.partition(":")
+                  name, value = name.strip(), value.strip()
+                  if sep and name and value:
+                      headers[name] = value
+              cookie = os.environ.get("GOPEED_COOKIE", "").strip()
+              if cookie:
+                  headers.setdefault("Cookie", cookie)
+              if headers:
+                  req["extra"] = {"method": "GET", "header": headers, "body": ""}
+          print(json.dumps({
+              "req": req,
+              "opts": {
+                  "path": os.path.abspath("work"),
+                  "extra": {"connections": int(os.environ["GOPEED_CONNECTIONS"])},
+              },
+          }))
+          PY
+          )
+
+          resp=$(curl -fsS -X POST http://127.0.0.1:9999/api/v1/tasks \
+            -H "Content-Type: application/json" \
+            -d "$task_body")
+          if [ "$(jq -r '.code' <<<"$resp")" != "0" ]; then
+            echo "::error::Gopeed 创建任务失败: $(jq -r '.msg' <<<"$resp")"
+            exit 1
+          fi
+          task_id=$(jq -r '.data' <<<"$resp")
+
+          status=""
+          for i in $(seq 1 600); do
+            resp=$(curl -fsS "http://127.0.0.1:9999/api/v1/tasks/${task_id}" || true)
+            status=$(jq -r '.data.status // "unknown"' <<<"$resp")
+            case "$status" in
+              done)
+                break
+                ;;
+              error)
+                echo "::error::Gopeed 下载失败"
+                exit 1
+                ;;
+            esac
+            if [ $((i % 12)) -eq 0 ]; then
+              downloaded=$(jq -r '.data.progress.downloaded // 0' <<<"$resp")
+              echo "下载中：${downloaded} 字节"
+            fi
+            sleep 5
+          done
+          if [ "$status" != "done" ]; then
+            echo "::error::下载超时（约 50 分钟），可在限制与调优里调大任务时长"
+            exit 1
+          fi
+
+          mapfile -t files < <(find work -type f -printf '%s\t%p\n' | sort -nr)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Gopeed 完成后 work/ 目录为空"
+            exit 1
+          fi
+
+          total=0
+          while IFS=$'\t' read -r sz _; do
+            total=$((total + sz))
+          done < <(printf '%s\n' "${files[@]}")
+
+          if [ "$total" -gt "$max_bytes" ]; then
+            echo "::error::文件合计超过 ${MAX_FILESIZE_GB}GB 上限（${total} 字节）"
+            exit 1
+          fi
+
+          if [ "${#files[@]}" -eq 1 ]; then
+            IFS=$'\t' read -r actual path <<< "${files[0]}"
+            name=$(basename "$path")
+          else
+            name="download.zip"
+            path="bundle.zip"
+            python3 - <<'PY'
+          import os, zipfile
+          with zipfile.ZipFile("bundle.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, _, names in os.walk("work"):
+                  for n in names:
+                      full = os.path.join(root, n)
+                      zf.write(full, os.path.relpath(full, "work"))
+          PY
+            actual=$(stat -c %s "$path")
+            if [ "$actual" -gt "$max_bytes" ]; then
+              echo "::error::打包后超过 ${MAX_FILESIZE_GB}GB 上限"
+              exit 1
+            fi
+          fi
+
+          safe=$(python3 - "$name" <<'PY'
+          import sys
+          name = sys.argv[1]
+          safe = "".join(c if (c.isalnum() or c in "._- ") else "_" for c in name)
+          safe = safe.strip("._") or "download.bin"
+          print(safe[-150:] if len(safe) > 150 else safe)
+          PY
+          )
+
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "filename=$safe" >> "$GITHUB_OUTPUT"
+          echo "size=$actual" >> "$GITHUB_OUTPUT"
+          echo "下载完成：$safe ($actual 字节，共 ${#files[@]} 个文件)"
+
+      - name: Install rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o rclone.zip
+          unzip -q rclone.zip
+          mkdir -p "$HOME/bin"
+          cp rclone-*-linux-amd64/rclone "$HOME/bin/rclone"
+          chmod +x "$HOME/bin/rclone"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/rclone" version
+
+      - name: rclone copy
+        id: rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          RCLONE_DEST: ${{ vars.RCLONE_DEST || secrets.RCLONE_DEST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::缺少 Secret RCLONE_CONF（rclone.conf 全文）"
+            exit 1
+          fi
+          if [ -z "$RCLONE_DEST" ]; then
+            echo "::error::缺少变量或 Secret RCLONE_DEST，例如 remote2:downloads"
+            exit 1
+          fi
+          dest="$RCLONE_DEST"
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "$RCLONE_CONF" > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+
+          rclone copy work "$dest" --progress --transfers 4 --checkers 8 --retries 3
+          echo "dest=$dest" >> "$GITHUB_OUTPUT"
+          echo "rclone 完成：$dest"
+
+      - name: Upload to tgstate
+        id: upload
+        env:
+          TGSTATE_URL: ${{ secrets.TGSTATE_URL }}
+          TGSTATE_PASSWORD: ${{ secrets.TGSTATE_PASSWORD }}
+          FILE_PATH: ${{ steps.download.outputs.path }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+        run: |
+          set -euo pipefail
+          base="${TGSTATE_URL%/}"
+
+          curl -fsS -c cookies.txt \
+            -H "Content-Type: application/json" \
+            -H "Origin: $base" \
+            -d "$(jq -n --arg p "$TGSTATE_PASSWORD" '{password: $p}')" \
+            "$base/api/auth/login" | jq -e '.status == "ok"' > /dev/null
+
+          upload_resp=$(curl -fsS -b cookies.txt \
+            -H "Origin: $base" \
+            -F "file=@${FILE_PATH};filename=${FILENAME}" \
+            "$base/api/upload")
+
+          short_id=$(echo "$upload_resp" | jq -er '.short_id')
+          share_url="$base/d/$short_id"
+          echo "share_url=$share_url" >> "$GITHUB_OUTPUT"
+          echo "上传完成：$share_url"
+
+      - name: Send result to Telegram
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ steps.prep.outputs.chat_id }}
+          SHARE_URL: ${{ steps.upload.outputs.share_url }}
+          RCLONE_DEST: ${{ steps.rclone.outputs.dest }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+          SIZE: ${{ steps.download.outputs.size }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CHAT_ID" ]; then
+            echo "无 chat_id（手动触发），结果见上方日志"
+            exit 0
+          fi
+          size_mb=$((SIZE / 1024 / 1024))
+          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\nrclone: %s\n链接: %s' "$FILENAME" "$size_mb" "$RCLONE_DEST" "$SHARE_URL")
+          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}" > /dev/null
+
+      - name: Send failure to Telegram
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CHAT_ID" ]; then
+            echo "::warning::缺少 chat_id，无法发送失败通知"
+            exit 0
+          fi
+          link_part=""
+          if [ -n "$DOWNLOAD_URL" ]; then
+            link_part=$'\n'"链接: ${DOWNLOAD_URL}"
+          fi
+          text=$(printf '[FAIL] 任务失败，查看日志: %s%s' "$RUN_URL" "$link_part")
+          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}" > /dev/null || true
