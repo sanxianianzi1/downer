@@ -111,6 +111,9 @@
 **/.env
 **/.env.local
 **/.env.*.local
+
+# Cloned on the VPS, not part of this repo
+tgstate-rust/
 *.pem
 *.key
 
