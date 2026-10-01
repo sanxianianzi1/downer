@@ -1,4 +1,4 @@
-name: Download, rclone copy, and upload to tgstate
+name: Download and upload to tgstate
 
 on:
   repository_dispatch:
@@ -223,38 +223,6 @@ jobs:
           echo "size=$actual" >> "$GITHUB_OUTPUT"
           echo "下载完成：$safe ($actual 字节，共 ${#files[@]} 个文件)"
 
-      - name: Install rclone
-        run: |
-          set -euo pipefail
-          curl -fsSL --retry 3 "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o rclone.zip
-          unzip -q rclone.zip
-          mkdir -p "$HOME/bin"
-          cp rclone-*-linux-amd64/rclone "$HOME/bin/rclone"
-          chmod +x "$HOME/bin/rclone"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          "$HOME/bin/rclone" version
-
-      - name: rclone copy
-        id: rclone
-        env:
-          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-          RCLONE_DEST: ${{ vars.RCLONE_DEST || secrets.RCLONE_DEST }}
-        run: |
-          set -euo pipefail
-          if [ -z "$RCLONE_CONF" ] || [ -z "$RCLONE_DEST" ]; then
-            echo "::notice::未配置 RCLONE_CONF / RCLONE_DEST，跳过 rclone 转存，文件仅上传 tgstate（存入 Telegram 频道）"
-            echo "dest=未启用 rclone 转存" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          dest="$RCLONE_DEST"
-          mkdir -p "$HOME/.config/rclone"
-          printf '%s\n' "$RCLONE_CONF" > "$HOME/.config/rclone/rclone.conf"
-          chmod 600 "$HOME/.config/rclone/rclone.conf"
-
-          rclone copy work "$dest" --progress --transfers 4 --checkers 8 --retries 3
-          echo "dest=$dest" >> "$GITHUB_OUTPUT"
-          echo "rclone 完成：$dest"
-
       - name: Upload to tgstate
         id: upload
         env:
@@ -268,18 +236,22 @@ jobs:
           base="${TGSTATE_URL//[[:space:]]/}"
           base="${base%/}"
 
-          curl -fsS -c cookies.txt \
+          curl -sS -c cookies.txt \
             -H "Content-Type: application/json" \
             -H "Origin: $base" \
             -d "$(jq -n --arg p "$TGSTATE_PASSWORD" '{password: $p}')" \
             "$base/api/auth/login" | jq -e '.status == "ok"' > /dev/null
 
-          upload_resp=$(curl -fsS -b cookies.txt \
+          http_code=$(curl -sS -b cookies.txt -o upload_resp.txt -w '%{http_code}' \
             -H "Origin: $base" \
             -F "file=@${FILE_PATH};filename=${FILENAME}" \
             "$base/api/upload")
+          if [ "$http_code" != "200" ]; then
+            echo "::error::tgstate 上传失败（HTTP $http_code）：$(head -c 2000 upload_resp.txt)"
+            exit 1
+          fi
 
-          short_id=$(echo "$upload_resp" | jq -er '.short_id')
+          short_id=$(jq -er '.short_id' upload_resp.txt)
           share_url="$base/d/$short_id"
           echo "share_url=$share_url" >> "$GITHUB_OUTPUT"
           echo "上传完成：$share_url"
@@ -290,7 +262,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ steps.prep.outputs.chat_id }}
           SHARE_URL: ${{ steps.upload.outputs.share_url }}
-          RCLONE_DEST: ${{ steps.rclone.outputs.dest }}
           FILENAME: ${{ steps.download.outputs.filename }}
           SIZE: ${{ steps.download.outputs.size }}
         run: |
@@ -300,7 +271,7 @@ jobs:
             exit 0
           fi
           size_mb=$((SIZE / 1024 / 1024))
-          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\nrclone: %s\n链接: %s' "$FILENAME" "$size_mb" "$RCLONE_DEST" "$SHARE_URL")
+          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\n链接: %s' "$FILENAME" "$size_mb" "$SHARE_URL")
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" > /dev/null
