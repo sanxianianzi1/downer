@@ -11,12 +11,15 @@ services:
       BASE_URL: ${TGSTATE_PUBLIC_URL}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       TRUST_FORWARDED_FOR: ${TRUST_FORWARDED_FOR:-0}
+      UPLOAD_CONCURRENCY: "1"
+      MAX_UPLOAD_BODY_SIZE_MB: ${MAX_UPLOAD_BODY_SIZE_MB:-10240}
     restart: unless-stopped
 
   bot:
     build: ./bot-worker
     container_name: tg-download-bot
     env_file: .env
+    command: ["node", "--no-network-family-autoselection", "--dns-result-order=ipv4first", "src/index.js"]
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
