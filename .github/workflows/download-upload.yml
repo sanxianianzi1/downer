@@ -3,11 +3,6 @@ name: Download, rclone copy, and upload to tgstate
 on:
   repository_dispatch:
     types: [download-task]
-  workflow_dispatch:
-    inputs:
-      url:
-        description: '下载链接（http/https/magnet/ed2k）'
-        required: true
 
 permissions: {}
 
@@ -29,7 +24,7 @@ jobs:
       - name: Validate link
         id: prep
         env:
-          PAYLOAD_URL: ${{ github.event.client_payload.url || inputs.url }}
+          PAYLOAD_URL: ${{ github.event.client_payload.url }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           set -euo pipefail
@@ -75,6 +70,26 @@ jobs:
           GOPEED_HEADERS: ${{ secrets.GOPEED_HEADERS }}
         run: |
           set -euo pipefail
+
+          # 直链预检：创建 Gopeed 任务前先探测链接可用性，412 通常是 Cookie 无效或过期
+          if [ "$DOWNLOAD_SCHEME" = "http" ] || [ "$DOWNLOAD_SCHEME" = "https" ]; then
+            code=$(curl -sS -L -o /dev/null --max-time 15 -r 0-1023 -w '%{http_code}' \
+              -H "Cookie: $GOPEED_COOKIE" "$DOWNLOAD_URL" || true)
+            case "$code" in
+              200|206|416)
+                echo "直链预检通过（HTTP $code）"
+                ;;
+              412)
+                echo "::error::直链预检失败：HTTP 412，通常是夸克 Cookie 无效或过期，请更新 Secret GOPEED_COOKIE"
+                exit 1
+                ;;
+              *)
+                echo "::error::直链预检失败：HTTP $code（链接可能已过期，或需要配置 GOPEED_HEADERS）"
+                exit 1
+                ;;
+            esac
+          fi
+
           mkdir -p work
           max_bytes=$((MAX_FILESIZE_GB * 1024 * 1024 * 1024))
 
@@ -276,10 +291,6 @@ jobs:
           SIZE: ${{ steps.download.outputs.size }}
         run: |
           set -euo pipefail
-          if [ -z "$CHAT_ID" ]; then
-            echo "无 chat_id（手动触发），结果见上方日志"
-            exit 0
-          fi
           size_mb=$((SIZE / 1024 / 1024))
           text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\nrclone: %s\n链接: %s' "$FILENAME" "$size_mb" "$RCLONE_DEST" "$SHARE_URL")
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
