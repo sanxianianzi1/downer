@@ -18,7 +18,7 @@ concurrency:
 env:
   # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
   MAX_FILESIZE_GB: "10"
-  GOPEED_CONNECTIONS: "64"
+  GOPEED_CONNECTIONS: "256"
   GOPEED_VERSION: "v1.9.3"
 
 jobs:
