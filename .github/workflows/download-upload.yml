@@ -18,7 +18,7 @@ concurrency:
 env:
   # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
   MAX_FILESIZE_GB: "10"
-  GOPEED_CONNECTIONS: "16"
+  GOPEED_CONNECTIONS: "64"
   GOPEED_VERSION: "v1.9.3"
 
 jobs:
@@ -241,13 +241,10 @@ jobs:
           RCLONE_DEST: ${{ vars.RCLONE_DEST || secrets.RCLONE_DEST }}
         run: |
           set -euo pipefail
-          if [ -z "$RCLONE_CONF" ]; then
-            echo "::error::缺少 Secret RCLONE_CONF（rclone.conf 全文）"
-            exit 1
-          fi
-          if [ -z "$RCLONE_DEST" ]; then
-            echo "::error::缺少变量或 Secret RCLONE_DEST，例如 remote2:downloads"
-            exit 1
+          if [ -z "$RCLONE_CONF" ] || [ -z "$RCLONE_DEST" ]; then
+            echo "::notice::未配置 RCLONE_CONF / RCLONE_DEST，跳过 rclone 转存，文件仅上传 tgstate（存入 Telegram 频道）"
+            echo "dest=未启用 rclone 转存" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           dest="$RCLONE_DEST"
           mkdir -p "$HOME/.config/rclone"
