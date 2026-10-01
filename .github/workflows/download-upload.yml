@@ -1,4 +1,4 @@
-name: Download and upload to tgstate
+name: Download, rclone copy, and upload to tgstate
 
 on:
   repository_dispatch:
@@ -53,36 +53,99 @@ jobs:
           PY
           echo "chat_id=$CHAT_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache: false
-
-      - name: Cache Gopeed CLI
-        uses: actions/cache@v4
-        with:
-          path: ~/go/bin/gopeed
-          key: gopeed-${{ env.GOPEED_VERSION }}-${{ runner.os }}-amd64
-
-      - name: Install Gopeed CLI
+      - name: Install Gopeed Web
         run: |
           set -euo pipefail
-          if [ ! -x "$HOME/go/bin/gopeed" ]; then
-            CGO_ENABLED=0 go install "github.com/GopeedLab/gopeed/cmd/gopeed@${GOPEED_VERSION}"
-          fi
-          gopeed -h
+          curl -fsSL --retry 3 -o gopeed-web.zip \
+            "https://github.com/GopeedLab/gopeed/releases/download/${GOPEED_VERSION}/gopeed-web-${GOPEED_VERSION}-linux-amd64.zip"
+          unzip -q gopeed-web.zip
+          chmod +x "gopeed-web-${GOPEED_VERSION}-linux-amd64/gopeed"
 
       - name: Download with Gopeed
         id: download
         env:
           DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
+          DOWNLOAD_SCHEME: ${{ steps.prep.outputs.scheme }}
+          GOPEED_COOKIE: ${{ secrets.GOPEED_COOKIE }}
+          GOPEED_HEADERS: ${{ secrets.GOPEED_HEADERS }}
         run: |
           set -euo pipefail
           mkdir -p work
           max_bytes=$((MAX_FILESIZE_GB * 1024 * 1024 * 1024))
 
-          gopeed -C "$GOPEED_CONNECTIONS" -D "$PWD/work" "$DOWNLOAD_URL"
+          dir="gopeed-web-${GOPEED_VERSION}-linux-amd64"
+          "$dir/gopeed" -A 127.0.0.1 -P 9999 -d "$PWD/.gopeed-storage" &
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9999/api/v1/info > /dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::Gopeed 服务启动失败"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          task_body=$(python3 - "$DOWNLOAD_URL" "$DOWNLOAD_SCHEME" <<'PY'
+          import json, os, sys
+
+          url, scheme = sys.argv[1], sys.argv[2]
+          req = {"url": url}
+          if scheme in ("http", "https"):
+              headers = {}
+              for line in os.environ.get("GOPEED_HEADERS", "").splitlines():
+                  name, sep, value = line.partition(":")
+                  name, value = name.strip(), value.strip()
+                  if sep and name and value:
+                      headers[name] = value
+              cookie = os.environ.get("GOPEED_COOKIE", "").strip()
+              if cookie:
+                  headers.setdefault("Cookie", cookie)
+              if headers:
+                  req["extra"] = {"method": "GET", "header": headers, "body": ""}
+          print(json.dumps({
+              "req": req,
+              "opts": {
+                  "path": os.path.abspath("work"),
+                  "extra": {"connections": int(os.environ["GOPEED_CONNECTIONS"])},
+              },
+          }))
+          PY
+          )
+
+          resp=$(curl -fsS -X POST http://127.0.0.1:9999/api/v1/tasks \
+            -H "Content-Type: application/json" \
+            -d "$task_body")
+          if [ "$(jq -r '.code' <<<"$resp")" != "0" ]; then
+            echo "::error::Gopeed 创建任务失败: $(jq -r '.msg' <<<"$resp")"
+            exit 1
+          fi
+          task_id=$(jq -r '.data' <<<"$resp")
+
+          status=""
+          for i in $(seq 1 600); do
+            resp=$(curl -fsS "http://127.0.0.1:9999/api/v1/tasks/${task_id}" || true)
+            status=$(jq -r '.data.status // "unknown"' <<<"$resp")
+            case "$status" in
+              done)
+                break
+                ;;
+              error)
+                echo "::error::Gopeed 下载失败"
+                exit 1
+                ;;
+            esac
+            if [ $((i % 12)) -eq 0 ]; then
+              downloaded=$(jq -r '.data.progress.downloaded // 0' <<<"$resp")
+              echo "下载中：${downloaded} 字节"
+            fi
+            sleep 5
+          done
+          if [ "$status" != "done" ]; then
+            echo "::error::下载超时（约 50 分钟），可在限制与调优里调大任务时长"
+            exit 1
+          fi
 
           mapfile -t files < <(find work -type f -printf '%s\t%p\n' | sort -nr)
           if [ "${#files[@]}" -eq 0 ]; then
@@ -135,6 +198,41 @@ jobs:
           echo "size=$actual" >> "$GITHUB_OUTPUT"
           echo "下载完成：$safe ($actual 字节，共 ${#files[@]} 个文件)"
 
+      - name: Install rclone
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o rclone.zip
+          unzip -q rclone.zip
+          mkdir -p "$HOME/bin"
+          cp rclone-*-linux-amd64/rclone "$HOME/bin/rclone"
+          chmod +x "$HOME/bin/rclone"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/rclone" version
+
+      - name: rclone copy
+        id: rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          RCLONE_DEST: ${{ vars.RCLONE_DEST || secrets.RCLONE_DEST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::缺少 Secret RCLONE_CONF（rclone.conf 全文）"
+            exit 1
+          fi
+          if [ -z "$RCLONE_DEST" ]; then
+            echo "::error::缺少变量或 Secret RCLONE_DEST，例如 remote2:downloads"
+            exit 1
+          fi
+          dest="$RCLONE_DEST"
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "$RCLONE_CONF" > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+
+          rclone copy work "$dest" --progress --transfers 4 --checkers 8 --retries 3
+          echo "dest=$dest" >> "$GITHUB_OUTPUT"
+          echo "rclone 完成：$dest"
+
       - name: Upload to tgstate
         id: upload
         env:
@@ -168,12 +266,13 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ steps.prep.outputs.chat_id }}
           SHARE_URL: ${{ steps.upload.outputs.share_url }}
+          RCLONE_DEST: ${{ steps.rclone.outputs.dest }}
           FILENAME: ${{ steps.download.outputs.filename }}
           SIZE: ${{ steps.download.outputs.size }}
         run: |
           set -euo pipefail
           size_mb=$((SIZE / 1024 / 1024))
-          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\n链接: %s' "$FILENAME" "$size_mb" "$SHARE_URL")
+          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\nrclone: %s\n链接: %s' "$FILENAME" "$size_mb" "$RCLONE_DEST" "$SHARE_URL")
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" > /dev/null
