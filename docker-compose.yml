@@ -1,0 +1,28 @@
+services:
+  tgstate:
+    build: ./tgstate-rust
+    container_name: tgstate
+    ports:
+      - "8000:7860"
+    volumes:
+      - tgstate_data:/app/data
+    environment:
+      PORT: "7860"
+      BASE_URL: ${TGSTATE_PUBLIC_URL}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      TRUST_FORWARDED_FOR: ${TRUST_FORWARDED_FOR:-0}
+    restart: unless-stopped
+
+  bot:
+    build: ./bot-worker
+    container_name: tg-download-bot
+    env_file: .env
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REPO: ${GITHUB_REPO}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
+    restart: unless-stopped
+
+volumes:
+  tgstate_data:
