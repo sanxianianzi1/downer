@@ -1,0 +1,44 @@
+diff --git a/src/constants.rs b/src/constants.rs
+index 0d3b5d9..372a41f 100644
+--- a/src/constants.rs
++++ b/src/constants.rs
+@@ -1,5 +1,17 @@
+-/// Maximum upload body size (512 MB)
+-pub const MAX_UPLOAD_BODY_SIZE: usize = 512 * 1024 * 1024;
++/// Maximum upload body size, in bytes. Default 10 GiB; override at runtime
++/// with env `MAX_UPLOAD_BODY_SIZE_MB` (megabytes, minimum 16). The previous
++/// fixed 512 MiB cap rejected large video uploads during multipart read
++/// (DefaultBodyLimit aborts before the streaming handler runs).
++pub fn max_upload_body_size() -> usize {
++    const DEFAULT_MB: usize = 10 * 1024;
++    std::env::var("MAX_UPLOAD_BODY_SIZE_MB")
++        .ok()
++        .and_then(|v| v.trim().parse::<usize>().ok())
++        .filter(|v| *v >= 16)
++        .unwrap_or(DEFAULT_MB)
++        * 1024
++        * 1024
++}
+ 
+ /// Telegram chunk size for large file uploads (~19.5 MB, under Telegram's 20MB limit)
+ pub const TELEGRAM_CHUNK_SIZE: usize = (19.5 * 1024.0 * 1024.0) as usize;
+diff --git a/src/main.rs b/src/main.rs
+index dfd46da..d30bb09 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -91,11 +91,14 @@ async fn main() {
+         }
+     });
+ 
++    let max_body = constants::max_upload_body_size();
++    tracing::info!("上传体积上限: {} MiB", max_body / 1024 / 1024);
++
+     // Build router
+     let app = Router::new()
+         .merge(routes::build_router(state.clone()))
+         .nest_service("/static", ServeDir::new("app/static"))
+-        .layer(DefaultBodyLimit::max(constants::MAX_UPLOAD_BODY_SIZE)) // 512MB
++        .layer(DefaultBodyLimit::max(max_body))
+         .layer(axum::middleware::from_fn_with_state(
+             state.clone(),
+             middleware::auth::auth_middleware,
