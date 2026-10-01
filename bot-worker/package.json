@@ -1,0 +1,8 @@
+{
+  "name": "tg-download-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  }
+}
