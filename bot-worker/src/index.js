@@ -13,6 +13,8 @@ const HELP_TEXT = [
   "",
   "机器人会把任务提交到 GitHub Actions，用 Gopeed 下载后 rclone 转存，并上传 tgstate，分享链接发回本会话。",
   "",
+  "支持一次粘贴多条链接（换行分隔），每条链接独立排队处理。",
+  "",
   "命令：/help 查看本说明",
 ].join("\n");
 
@@ -55,22 +57,28 @@ function isAllowedUser(userId) {
   return allowList.includes(userId);
 }
 
-function extractUrl(text) {
-  const magnet = text.match(/magnet:\?[^\s<>"'`]+/i);
-  if (magnet) return magnet[0];
+const MAX_URLS_PER_MESSAGE = 20;
 
-  const ed2k = text.match(/ed2k:\/\/[^\s<>"'`]+/i);
-  if (ed2k) return ed2k[0];
-
-  const m = text.match(/https?:\/\/[^\s<>"'`]+/i);
-  if (!m) return null;
-  try {
-    const u = new URL(m[0]);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return u.toString();
-  } catch {
-    return null;
+function extractUrls(text) {
+  const urls = [];
+  const seen = new Set();
+  const re = /magnet:\?[^\s<>"'`]+|ed2k:\/\/[^\s<>"'`]+|https?:\/\/[^\s<>"'`]+/gi;
+  for (const m of text.matchAll(re)) {
+    const raw = m[0];
+    if (seen.has(raw)) continue;
+    if (/^https?:/i.test(raw)) {
+      try {
+        const u = new URL(raw);
+        if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+      } catch {
+        continue;
+      }
+    }
+    seen.add(raw);
+    urls.push(raw);
+    if (urls.length >= MAX_URLS_PER_MESSAGE) break;
   }
+  return urls;
 }
 
 async function dispatchDownload(url, chatId) {
@@ -111,8 +119,15 @@ async function handleUpdate(update) {
     return;
   }
 
-  const url = extractUrl(text);
-  if (!url) {
+  const dispatchHints = {
+    401: "GitHub Token 无效或过期。",
+    403: "GitHub Token 权限不足，需要对仓库的 Contents 读写权限。",
+    404: "仓库不存在或 Token 无权访问，请检查 GITHUB_REPO 配置。",
+    422: "仓库中没有监听 download-task 事件的 workflow，请确认 workflow 文件已推送到默认分支。",
+  };
+
+  const urls = extractUrls(text);
+  if (urls.length === 0) {
     await sendTelegramMessage(
       chatId,
       "未识别到下载链接，请发送 http/https、magnet 或 ed2k 链接。"
@@ -120,31 +135,46 @@ async function handleUpdate(update) {
     return;
   }
 
-  let resp;
-  try {
-    resp = await dispatchDownload(url, chatId);
-  } catch (e) {
-    await sendTelegramMessage(chatId, `提交任务失败：网络错误 ${e.message}`);
-    return;
-  }
-
-  if (resp.ok) {
-    await sendTelegramMessage(
-      chatId,
-      `任务已提交，GitHub Actions 开始处理：\n${url}\n\n下载并上传完成后，分享链接会自动发到这里。`
-    );
-    return;
-  }
-
-  const body = await resp.text().catch(() => "");
-  const hints = {
-    401: "GitHub Token 无效或过期。",
-    403: "GitHub Token 权限不足，需要对仓库的 Contents 读写权限。",
-    404: "仓库不存在或 Token 无权访问，请检查 GITHUB_REPO 配置。",
-    422: "仓库中没有监听 download-task 事件的 workflow，请确认 workflow 文件已推送到默认分支。",
+  const describeUrl = (u) => {
+    if (!/^https?:/i.test(u)) return u.length > 80 ? `${u.slice(0, 77)}...` : u;
+    try {
+      const parsed = new URL(u);
+      const name = parsed.searchParams.get("filename");
+      if (name) return `${parsed.host} · ${name}`;
+    } catch {}
+    return u.length > 80 ? `${u.slice(0, 77)}...` : u;
   };
-  const hint = hints[resp.status] || `HTTP ${resp.status} ${body.slice(0, 200)}`;
-  await sendTelegramMessage(chatId, `任务提交失败：${hint}`);
+
+  const submitted = [];
+  const failed = [];
+  for (const url of urls) {
+    let resp;
+    try {
+      resp = await dispatchDownload(url, chatId);
+    } catch (e) {
+      failed.push(`${describeUrl(url)}\n    网络错误：${e.message}`);
+      continue;
+    }
+    if (resp.ok) {
+      submitted.push(url);
+      continue;
+    }
+    const body = await resp.text().catch(() => "");
+    const hint = dispatchHints[resp.status] || `HTTP ${resp.status} ${body.slice(0, 200)}`;
+    failed.push(`${describeUrl(url)}\n    ${hint}`);
+  }
+
+  const lines = [];
+  if (submitted.length > 0) {
+    lines.push(
+      `已提交 ${submitted.length} 个任务，GitHub Actions 排队处理中（完成后分享链接会逐条发到这里）：`,
+      ...submitted.map((u) => `· ${describeUrl(u)}`)
+    );
+  }
+  if (failed.length > 0) {
+    lines.push(`提交失败 ${failed.length} 个：`, ...failed.map((f) => `· ${f}`));
+  }
+  await sendTelegramMessage(chatId, lines.join("\n"));
 }
 
 async function telegramCall(method, params) {
