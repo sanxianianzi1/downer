@@ -72,10 +72,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 直链预检：创建 Gopeed 任务前先探测链接可用性，412 通常是 Cookie 无效或过期
+          # 直链预检：创建 Gopeed 任务前先探测链接可用性
+          # 仅 412/401/403/404 这类确定性失败才中断；000 与 5xx 属网络/CDN 抖动，
+          # 重试后仍失败只告警并放行，交给 Gopeed 自行重试，避免一次抖动整单失败。
           if [ "$DOWNLOAD_SCHEME" = "http" ] || [ "$DOWNLOAD_SCHEME" = "https" ]; then
-            code=$(curl -sS -L -o /dev/null --max-time 15 -r 0-1023 -w '%{http_code}' \
-              -H "Cookie: $GOPEED_COOKIE" "$DOWNLOAD_URL" || true)
+            set +e
+            code=$(curl -sS -L -o /dev/null --max-time 20 --connect-timeout 10 \
+              --retry 4 --retry-delay 3 --retry-connrefused --retry-all-errors \
+              -r 0-1023 -w '%{http_code}' \
+              -H "Cookie: $GOPEED_COOKIE" "$DOWNLOAD_URL" 2>/dev/null)
+            curl_rc=$?
+            set -e
+            echo "预检结果：HTTP ${code:-000}（curl exit=${curl_rc}）"
+
             case "$code" in
               200|206|416)
                 echo "直链预检通过（HTTP $code）"
@@ -84,9 +93,20 @@ jobs:
                 echo "::error::直链预检失败：HTTP 412，通常是夸克 Cookie 无效或过期，请更新 Secret GOPEED_COOKIE"
                 exit 1
                 ;;
-              *)
-                echo "::error::直链预检失败：HTTP $code（链接可能已过期，或需要配置 GOPEED_HEADERS）"
+              401|403)
+                echo "::error::直链预检失败：HTTP $code，通常是鉴权失败（链接已过期，或需要配置 GOPEED_HEADERS）"
                 exit 1
+                ;;
+              404)
+                echo "::error::直链预检失败：HTTP 404，链接可能已过期或被删除"
+                exit 1
+                ;;
+              *)
+                if [ "$code" = "000" ]; then
+                  echo "::warning::直链预检未拿到响应（HTTP 000，curl exit=${curl_rc}）：网络不可达或 CDN 抖动，已重试 4 次，继续交给 Gopeed 下载"
+                else
+                  echo "::warning::直链预检返回 HTTP $code（curl exit=${curl_rc}）：疑似 CDN 侧临时异常，继续交给 Gopeed 下载"
+                fi
                 ;;
             esac
           fi
