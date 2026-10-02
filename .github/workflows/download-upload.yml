@@ -9,7 +9,8 @@ on:
         description: '下载链接（http/https/magnet/ed2k）'
         required: true
 
-permissions: {}
+permissions:
+  actions: write
 
 env:
   # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
@@ -293,3 +294,13 @@ jobs:
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" > /dev/null || true
+
+      - name: 清理运行记录
+        if: always()
+        continue-on-error: true
+        uses: Mattraks/delete-workflow-runs@v1.2.3
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 1
+          keep_minimum_runs: 0
