@@ -1,0 +1,14 @@
+[Unit]
+Description=TG download bot (downer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/downer/bot-worker
+EnvironmentFile=/opt/downer/bot-worker/bot.env
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
