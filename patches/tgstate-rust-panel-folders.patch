@@ -1,0 +1,646 @@
+diff --git a/app/static/css/style.css b/app/static/css/style.css
+index 45b7687..f356de1 100644
+--- a/app/static/css/style.css
++++ b/app/static/css/style.css
+@@ -641,3 +641,97 @@ input[type="checkbox"] {
+         width: 100%;
+     }
+ }
++
++/* ============================================================
++   目录管理（文件管理页）
++   ============================================================ */
++
++.crumbs {
++    display: flex;
++    align-items: center;
++    flex-wrap: wrap;
++    gap: var(--spacing-xs);
++    font-size: var(--font-size-sm);
++    color: var(--text-secondary);
++    min-height: 32px;
++}
++
++.crumbs a {
++    color: var(--accent-color);
++    text-decoration: none;
++    cursor: pointer;
++    padding: 2px 6px;
++    border-radius: var(--radius-sm);
++}
++
++.crumbs a:hover {
++    background: var(--bg-hover);
++}
++
++.crumbs .crumb-current {
++    font-weight: 600;
++    color: var(--text-primary);
++    padding: 2px 6px;
++}
++
++.crumbs .crumb-sep {
++    color: var(--text-tertiary);
++}
++
++.folder-grid {
++    display: grid;
++    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++    gap: var(--spacing-sm);
++}
++
++.folder-card {
++    display: flex;
++    align-items: center;
++    gap: var(--spacing-sm);
++    padding: var(--spacing-sm) var(--spacing-md);
++    background: var(--bg-surface);
++    border: 1px solid var(--border-light);
++    border-radius: var(--radius-md);
++    box-shadow: var(--shadow-sm);
++}
++
++.folder-card:hover {
++    background: var(--bg-hover);
++}
++
++.folder-card .folder-icon {
++    flex-shrink: 0;
++    color: var(--accent-color);
++}
++
++.folder-card .folder-open {
++    flex: 1;
++    min-width: 0;
++    cursor: pointer;
++    background: none;
++    border: none;
++    padding: 0;
++    text-align: left;
++    font: inherit;
++    color: var(--text-primary);
++}
++
++.folder-card .folder-name {
++    display: block;
++    font-weight: 600;
++    white-space: nowrap;
++    overflow: hidden;
++    text-overflow: ellipsis;
++}
++
++.folder-card .folder-meta {
++    display: block;
++    font-size: var(--font-size-sm);
++    color: var(--text-tertiary);
++}
++
++.folder-card .folder-actions {
++    display: flex;
++    gap: 2px;
++    flex-shrink: 0;
++}
+diff --git a/app/static/js/main.js b/app/static/js/main.js
+index 3f94d72..eeb5433 100644
+--- a/app/static/js/main.js
++++ b/app/static/js/main.js
+@@ -33,6 +33,9 @@ document.addEventListener('DOMContentLoaded', () => {
+         lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>',
+         lockBadge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>',
+         trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>',
++        folder: '<svg class="folder-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></svg>',
++        move: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 12 12"></path><path d="M14 2h8v8"></path><path d="M20 13v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7"></path></svg>',
++        pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path></svg>',
+     };
+ 
+     const fmtDate = (v) => {
+@@ -66,6 +69,237 @@ document.addEventListener('DOMContentLoaded', () => {
+         return itemOrId.dataset.fileId || itemOrId.dataset.shortId || '';
+     }
+ 
++    // ================================================================
++    // 目录管理（面板侧）
++    // ================================================================
++    const folderGrid = document.getElementById('folder-grid');
++    const crumbs = document.getElementById('folder-crumbs');
++    const mkdirBtn = document.getElementById('mkdir-btn');
++
++    // null = 根目录
++    let currentFolderId = null;
++    // 面包屑路径：[{id: null, name: '根目录'}, ...]
++    let currentTrail = [{ id: null, name: '根目录' }];
++
++    async function apiJson(url, options = {}) {
++        const res = await fetch(url, { credentials: 'same-origin', ...options });
++        if (res.status === 401) {
++            Toast.show('请先登录', 'error');
++            setTimeout(() => { location.href = '/pwd.html'; }, 500);
++            const err = new Error('unauthorized');
++            err.silent = true;
++            throw err;
++        }
++        const data = await res.json().catch(() => ({}));
++        return { ok: res.ok, status: res.status, data };
++    }
++
++    function fileSizeMb(bytes) {
++        return ((Number(bytes) || 0) / 1048576).toFixed(2) + ' MB';
++    }
++
++    function renderCrumbs() {
++        if (!crumbs) return;
++        crumbs.innerHTML = currentTrail.map((n, i) => {
++            const last = i === currentTrail.length - 1;
++            if (last) return '<span class="crumb-current">' + escapeHtml(n.name) + '</span>';
++            return '<a data-fid="' + (n.id == null ? '' : String(n.id)) + '">' + escapeHtml(n.name) + '</a>'
++                + '<span class="crumb-sep">/</span>';
++        }).join('');
++    }
++
++    function renderFolderGrid(folders) {
++        if (!folderGrid) return;
++        if (!folders.length) { folderGrid.innerHTML = ''; return; }
++        folderGrid.innerHTML = folders.map((f) =>
++            '<div class="folder-card" data-fid="' + f.id + '">'
++            + ICO.folder
++            + '<button type="button" class="folder-open" title="打开目录">'
++            + '<span class="folder-name">' + escapeHtml(f.name) + '</span>'
++            + '<span class="folder-meta">' + (f.folder_count || 0) + ' 个目录 · ' + (f.file_count || 0) + ' 个文件</span>'
++            + '</button>'
++            + '<div class="folder-actions">'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm folder-rename" data-fid="' + f.id + '" data-name="' + escapeHtml(f.name) + '" title="改名">' + ICO.pencil + '</button>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm folder-delete" data-fid="' + f.id + '" data-name="' + escapeHtml(f.name) + '" title="删除">' + ICO.trash + '</button>'
++            + '</div></div>'
++        ).join('');
++    }
++
++    function fileRowHtml(f) {
++        const rawId = f.file_id || '';
++        const fid = escapeHtml(rawId);
++        const locked = !!f.has_password;
++        const url = escapeHtml('/d/' + (f.short_id || f.file_id));
++        return '<tr class="file-item" id="' + rowDomId(rawId) + '"'
++            + ' data-file-id="' + fid + '"'
++            + ' data-short-id="' + escapeHtml(f.short_id || '') + '"'
++            + ' data-filename="' + escapeHtml(f.filename || '') + '"'
++            + ' data-file-url="/d/' + escapeHtml(f.short_id || f.file_id) + '"'
++            + ' data-has-password="' + (locked ? 'true' : 'false') + '"'
++            + ' data-folder-id="' + (f.folder_id == null ? '' : escapeHtml(String(f.folder_id))) + '">'
++            + '<td><input type="checkbox" class="checkbox file-checkbox" data-file-id="' + fid + '"></td>'
++            + '<td><div class="fname">' + ICO.file + '<span class="ftext">' + escapeHtml(f.filename || '') + '</span>'
++            + '<span class="badge badge-lock js-lock-badge" title="已设访问密码" ' + (locked ? '' : 'style="display:none;"') + '>' + ICO.lockBadge + '</span></div></td>'
++            + '<td class="text-sm muted">' + escapeHtml(fileSizeMb(f.filesize)) + '</td>'
++            + '<td class="text-sm muted">' + escapeHtml(fmtDate(f.upload_date)) + '</td>'
++            + '<td class="col-actions"><div class="row-actions">'
++            + '<a href="' + url + '" class="btn btn-ghost btn-icon btn-sm" title="下载">' + ICO.download + '</a>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm copy-link-btn" title="复制链接">' + ICO.copy + '</button>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm js-lock" title="分享密码">' + ICO.lock + '</button>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm js-move" title="移动到目录">' + ICO.move + '</button>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm js-rename" title="改名">' + ICO.pencil + '</button>'
++            + '<button type="button" class="btn btn-ghost btn-icon btn-sm js-delete" data-file-id="' + fid + '" title="删除">' + ICO.trash + '</button>'
++            + '</div></td></tr>';
++    }
++
++    function renderFileTable(files) {
++        if (!listBody) return;
++        if (files.length) {
++            listBody.innerHTML = files.map(fileRowHtml).join('');
++        } else {
++            listBody.innerHTML = '<tr><td colspan="5"><div class="empty" style="padding:44px;"><div class="muted">此目录暂无文件</div></div></td></tr>';
++        }
++        updateBatch();
++    }
++
++    async function loadFolder(fid) {
++        const q = fid == null ? '' : ('?parent_id=' + encodeURIComponent(String(fid)));
++        const { ok, status, data } = await apiJson('/api/folders' + q);
++        if (!ok) {
++            Toast.show((data && data.message) || ('加载目录失败(' + status + ')'), 'error');
++            return;
++        }
++        currentFolderId = data.parent_id == null ? null : data.parent_id;
++        // 只展示当前目录直属文件（含所有目录的全量搜索交给搜索框过滤 DOM）
++        renderFolderGrid(data.folders || []);
++        renderFileTable(data.files || []);
++        // 从根构建面包屑：沿 parent 链向上需要逐级请求，这里直接维护 trail
++        if (!currentTrail.some((n) => n.id === currentFolderId)) {
++            // 直接跳转（刷新后首次加载）：重置并惰性补全
++            currentTrail = [{ id: null, name: '根目录' }];
++        } else {
++            currentTrail = currentTrail.slice(0, currentTrail.findIndex((n) => n.id === currentFolderId) + 1);
++        }
++        renderCrumbs();
++    }
++
++    async function enterFolder(fid, name) {
++        currentTrail.push({ id: fid, name });
++        await loadFolder(fid);
++    }
++
++    if (folderGrid) {
++        folderGrid.addEventListener('click', async (e) => {
++            const openBtn = e.target.closest('.folder-open');
++            if (openBtn) {
++                const card = openBtn.closest('.folder-card');
++                await enterFolder(Number(card.dataset.fid), card.querySelector('.folder-name').textContent);
++                return;
++            }
++            const renBtn = e.target.closest('.folder-rename');
++            if (renBtn) {
++                e.preventDefault();
++                const fid = renBtn.dataset.fid;
++                const name = await Modal.prompt('目录改名', '输入新名称。', { value: renBtn.dataset.name, okText: '保存' });
++                if (name === null || !name.trim()) return;
++                const { ok, status, data } = await apiJson('/api/folders/' + encodeURIComponent(fid) + '/rename', {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ name }),
++                });
++                if (ok) { Toast.show('目录已改名'); await loadFolder(currentFolderId); }
++                else Toast.show((data && data.message) || ('改名失败(' + status + ')'), 'error');
++                return;
++            }
++            const delBtn = e.target.closest('.folder-delete');
++            if (delBtn) {
++                e.preventDefault();
++                const fid = delBtn.dataset.fid;
++                const name = delBtn.dataset.name;
++                const ok = await Modal.confirm('删除目录',
++                    '「' + name + '」及其全部子目录与文件将被永久删除（TG 无回收站），确定？',
++                    { danger: true, okText: '删除' });
++                if (!ok) return;
++                const { ok: okRes, status, data } = await apiJson('/api/folders/' + encodeURIComponent(fid), { method: 'DELETE' });
++                if (okRes) {
++                    const d = data || {};
++                    Toast.show('已删除 ' + (d.folders_deleted || 0) + ' 个目录、' + (d.files_deleted || 0) + ' 个文件'
++                        + ((d.failed_files || []).length ? '（' + d.failed_files.length + ' 个文件删除失败，已移回根目录）' : ''));
++                    await loadFolder(currentFolderId);
++                } else {
++                    Toast.show((data && data.message) || ('删除失败(' + status + ')'), 'error');
++                }
++            }
++        });
++    }
++
++    if (crumbs) {
++        crumbs.addEventListener('click', async (e) => {
++            const a = e.target.closest('a[data-fid]');
++            if (!a) return;
++            const fid = a.dataset.fid === '' ? null : Number(a.dataset.fid);
++            await loadFolder(fid);
++        });
++    }
++
++    if (mkdirBtn) {
++        mkdirBtn.addEventListener('click', async () => {
++            const name = await Modal.prompt('新建目录', '输入目录名称。', { okText: '创建' });
++            if (name === null || !name.trim()) return;
++            const body = { name };
++            if (currentFolderId != null) body.parent_id = currentFolderId;
++            const { ok, status, data } = await apiJson('/api/folders', {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(body),
++            });
++            if (ok) { Toast.show('目录已创建'); await loadFolder(currentFolderId); }
++            else Toast.show((data && data.message) || ('创建失败(' + status + ')'), 'error');
++        });
++    }
++
++    // ---- 文件移动 / 改名（面板） ----
++    async function moveFile(fileId, filename) {
++        if (!fileId) { Toast.show('缺少文件标识', 'error'); return; }
++        const target = await Modal.prompt('移动文件',
++            '将「' + (filename || fileId) + '」移动到目标目录。输入目录路径：/ 表示根目录，/影视/2026 表示逐层目录。',
++            { placeholder: '/', okText: '移动' });
++        if (target === null) return;
++        const { ok, status, data } = await apiJson('/api/files/' + encodeURIComponent(fileId) + '/move', {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ target_path: target }),
++        });
++        if (ok) {
++            Toast.show('文件已移动到「' + (target.trim() === '' ? '根目录' : target) + '」');
++            await loadFolder(currentFolderId);
++        } else {
++            Toast.show((data && data.message) || ('移动失败(' + status + ')'), 'error');
++        }
++    }
++
++    async function renameFile(fileId, filename) {
++        if (!fileId) { Toast.show('缺少文件标识', 'error'); return; }
++        const name = await Modal.prompt('文件改名', '输入新文件名。', { value: filename || '', okText: '保存' });
++        if (name === null || !name.trim()) return;
++        const { ok, status, data } = await apiJson('/api/files/' + encodeURIComponent(fileId) + '/rename', {
++            method: 'PATCH',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ filename: name }),
++        });
++        if (ok) {
++            const it = document.getElementById(rowDomId(fileId));
++            if (it) {
++                it.dataset.filename = name;
++                const span = it.querySelector('.ftext');
++                if (span) span.textContent = name;
++            }
++            Toast.show('文件已改名');
++        } else {
++            Toast.show((data && data.message) || ('改名失败(' + status + ')'), 'error');
++        }
++    }
++
+     function absoluteFileUrl(item) {
+         let url = (item && item.dataset.fileUrl) || '';
+         if (!url && item && item.dataset.shortId) url = '/d/' + item.dataset.shortId;
+@@ -106,6 +340,8 @@ document.addEventListener('DOMContentLoaded', () => {
+                 <a href="${url}" class="btn btn-ghost btn-icon btn-sm" title="下载">${ICO.download}</a>
+                 <button type="button" class="btn btn-ghost btn-icon btn-sm copy-link-btn" title="复制链接">${ICO.copy}</button>
+                 <button type="button" class="btn btn-ghost btn-icon btn-sm js-lock" title="分享密码">${ICO.lock}</button>
++                <button type="button" class="btn btn-ghost btn-icon btn-sm js-move" title="移动到目录">${ICO.move}</button>
++                <button type="button" class="btn btn-ghost btn-icon btn-sm js-rename" title="改名">${ICO.pencil}</button>
+                 <button type="button" class="btn btn-ghost btn-icon btn-sm js-delete" data-file-id="${fid}" title="删除">${ICO.trash}</button>
+             </div></td>`;
+         listBody.prepend(tr);
+@@ -199,6 +435,20 @@ document.addEventListener('DOMContentLoaded', () => {
+             const it = delBtn.closest('.file-item');
+             const id = apiIdFor(it) || delBtn.dataset.fileId;
+             deleteFile(id, it && it.dataset.filename);
++            return;
++        }
++        const moveBtn = e.target.closest('.js-move');
++        if (moveBtn) {
++            e.preventDefault();
++            const it = moveBtn.closest('.file-item');
++            moveFile(apiIdFor(it), it && it.dataset.filename);
++            return;
++        }
++        const renFileBtn = e.target.closest('.js-rename');
++        if (renFileBtn) {
++            e.preventDefault();
++            const it = renFileBtn.closest('.file-item');
++            renameFile(apiIdFor(it), it && it.dataset.filename);
+         }
+     });
+ 
+@@ -375,4 +625,9 @@ document.addEventListener('DOMContentLoaded', () => {
+         };
+         connect();
+     }
++
++    // ---- 目录视图初始化（覆盖 SSR 全量列表，统一为根目录视图） ----
++    if (listBody && !isGallery && folderGrid) {
++        loadFolder(null).catch((e) => { if (!e || !e.silent) console.error(e); });
++    }
+ });
+diff --git a/app/templates/index.html b/app/templates/index.html
+index 2353565..5454fd7 100644
+--- a/app/templates/index.html
++++ b/app/templates/index.html
+@@ -34,6 +34,12 @@
+     <div id="prog-zone" class="stack" style="gap:10px;"></div>
+     <div id="done-zone" class="stack" style="gap:10px;"></div>
+ 
++    <div class="between wrap" style="gap:10px;">
++        <nav id="folder-crumbs" class="crumbs" aria-label="目录路径"></nav>
++        <button id="mkdir-btn" class="btn btn-secondary btn-sm" type="button">+ 新建目录</button>
++    </div>
++    <div id="folder-grid" class="folder-grid"></div>
++
+     <div class="batchbar hidden" id="batch-actions-bar">
+         <span class="text-sm" style="font-weight:600;"><span id="selection-counter">0</span> 项已选</span>
+         <div class="row">
+@@ -60,7 +66,7 @@
+                         <tr class="file-item" id="file-item-{{ f.file_id | replace(from=':', to='-') }}"
+                             data-file-id="{{ f.file_id }}" data-short-id="{{ f.short_id }}"
+                             data-filename="{{ f.filename }}" data-file-url="/d/{{ f.display_id }}"
+-                            data-has-password="{{ f.has_password }}">
++                            data-has-password="{{ f.has_password }}" data-folder-id="{{ f.folder_id }}">
+                             <td><input type="checkbox" class="checkbox file-checkbox" data-file-id="{{ f.file_id }}"></td>
+                             <td>
+                                 <div class="fname">
+@@ -76,6 +82,8 @@
+                                     <a href="/d/{{ f.display_id }}" class="btn btn-ghost btn-icon btn-sm" title="下载"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></a>
+                                     <button type="button" class="btn btn-ghost btn-icon btn-sm copy-link-btn" title="复制链接"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>
+                                     <button type="button" class="btn btn-ghost btn-icon btn-sm js-lock" title="分享密码"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
++                                    <button type="button" class="btn btn-ghost btn-icon btn-sm js-move" title="移动到目录"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 12 12"></path><path d="M14 2h8v8"></path><path d="M20 13v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7"></path></svg></button>
++                                    <button type="button" class="btn btn-ghost btn-icon btn-sm js-rename" title="改名"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path></svg></button>
+                                     <button type="button" class="btn btn-ghost btn-icon btn-sm js-delete" data-file-id="{{ f.file_id }}" title="删除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
+                                 </div>
+                             </td>
+@@ -90,5 +98,5 @@
+     </div>
+     {% endif %}
+ </div>
+-<script src="/static/js/main.js?v=5.5"></script>
++<script src="/static/js/main.js?v=5.6"></script>
+ {% endblock %}
+diff --git a/src/database.rs b/src/database.rs
+index da8465e..6039f63 100644
+--- a/src/database.rs
++++ b/src/database.rs
+@@ -233,6 +233,8 @@ pub struct FileMetadata {
+     pub filesize: i64,
+     pub upload_date: String,
+     pub short_id: Option<String>,
++    /// 所属目录；None = 根目录。
++    pub folder_id: Option<i64>,
+     // 分享密码的 argon2 哈希；绝不序列化给前端（只暴露 has_password 布尔）。
+     #[serde(skip_serializing)]
+     pub share_password: Option<String>,
+@@ -252,7 +254,7 @@ pub fn get_all_files(pool: &DbPool) -> Result<Vec<FileMetadata>, AppErrorKind> {
+     let conn = pool.get()?;
+     let mut stmt = conn
+         .prepare(
+-            "SELECT filename, file_id, filesize, upload_date, short_id, share_password FROM files ORDER BY upload_date DESC",
++            "SELECT filename, file_id, filesize, upload_date, short_id, share_password, folder_id FROM files ORDER BY upload_date DESC",
+         )?;
+ 
+     let files = stmt
+@@ -264,6 +266,7 @@ pub fn get_all_files(pool: &DbPool) -> Result<Vec<FileMetadata>, AppErrorKind> {
+                 upload_date: row.get::<_, String>(3).unwrap_or_default(),
+                 short_id: row.get(4).ok(),
+                 share_password: norm_share_password(row.get(5).ok()),
++                folder_id: row.get(6).ok(),
+             })
+         })?
+         .filter_map(|r| r.ok())
+@@ -275,7 +278,7 @@ pub fn get_all_files(pool: &DbPool) -> Result<Vec<FileMetadata>, AppErrorKind> {
+ pub fn get_file_by_id(pool: &DbPool, identifier: &str) -> Result<Option<FileMetadata>, AppErrorKind> {
+     let conn = pool.get()?;
+     let result = conn.query_row(
+-        "SELECT filename, filesize, upload_date, file_id, short_id, share_password FROM files WHERE short_id = ?1 OR file_id = ?1",
++        "SELECT filename, filesize, upload_date, file_id, short_id, share_password, folder_id FROM files WHERE short_id = ?1 OR file_id = ?1",
+         params![identifier],
+         |row| {
+             Ok(FileMetadata {
+@@ -285,6 +288,7 @@ pub fn get_file_by_id(pool: &DbPool, identifier: &str) -> Result<Option<FileMeta
+                 file_id: row.get(3)?,
+                 short_id: row.get(4).ok(),
+                 share_password: norm_share_password(row.get(5).ok()),
++                folder_id: row.get(6).ok(),
+             })
+         },
+     );
+@@ -457,7 +461,7 @@ fn query_folder_files(
+     params: &[Option<i64>],
+ ) -> Result<Vec<FileMetadata>, AppErrorKind> {
+     let sql = format!(
+-        "SELECT filename, file_id, filesize, upload_date, short_id, share_password FROM files {} \
++        "SELECT filename, file_id, filesize, upload_date, short_id, share_password, folder_id FROM files {} \
+          ORDER BY filename COLLATE NOCASE",
+         where_clause
+     );
+@@ -471,6 +475,7 @@ fn query_folder_files(
+                 upload_date: row.get::<_, String>(3).unwrap_or_default(),
+                 short_id: row.get(4).ok(),
+                 share_password: norm_share_password(row.get(5).ok()),
++                folder_id: row.get(6).ok(),
+             })
+         })?
+         .filter_map(|r| r.ok())
+diff --git a/src/routes/api_bot.rs b/src/routes/api_bot.rs
+index 1599d10..520f137 100644
+--- a/src/routes/api_bot.rs
++++ b/src/routes/api_bot.rs
+@@ -90,6 +90,9 @@ struct CreateFolderBody {
+ #[derive(Deserialize)]
+ struct MoveBody {
+     target_folder_id: Option<i64>,
++    /// 面板用：按路径移动（"/"=根，"/影视/2026"），服务端逐段解析。
++    #[serde(default)]
++    target_path: Option<String>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -395,7 +398,17 @@ async fn move_file(
+     Path(file_id): Path<String>,
+     Json(body): Json<MoveBody>,
+ ) -> Response {
+-    if let Some(pid) = body.target_folder_id {
++    let mut target_folder_id = body.target_folder_id;
++    if target_folder_id.is_none() {
++        if let Some(raw_path) = body.target_path.as_deref() {
++            match resolve_folder_path(&state, raw_path).await {
++                Ok(pid) => target_folder_id = pid,
++                Err(resp) => return resp,
++            }
++        }
++    }
++
++    if let Some(pid) = target_folder_id {
+         match database::get_folder(&state.db_pool, pid) {
+             Ok(Some(_)) => {}
+             Ok(None) => {
+@@ -431,12 +444,12 @@ async fn move_file(
+         }
+     };
+ 
+-    match database::set_file_folder(&state.db_pool, &file_id, body.target_folder_id) {
++    match database::set_file_folder(&state.db_pool, &file_id, target_folder_id) {
+         Ok(true) => Json(json!({
+             "status": "ok",
+             "short_id": meta.short_id,
+             "filename": meta.filename,
+-            "folder_id": body.target_folder_id,
++            "folder_id": target_folder_id,
+         }))
+         .into_response(),
+         Ok(false) => {
+@@ -566,6 +579,67 @@ async fn delete_file_bot(
+         .into_response()
+ }
+ 
++/// 按 "/" 分段逐层解析目录路径，返回目标目录 id（根目录为 None）。
++/// 支持 "." 与 ".." 段；任一层目录不存在即报 404。
++async fn resolve_folder_path(state: &Arc<AppState>, raw: &str) -> Result<Option<i64>, Response> {
++    let mut cur: Option<i64> = None;
++    for seg in raw.split('/') {
++        let seg = seg.trim();
++        if seg.is_empty() || seg == "." {
++            continue;
++        }
++        if seg == ".." {
++            cur = match cur {
++                None => {
++                    return Err(
++                        http_error(StatusCode::BAD_REQUEST, "路径已到根目录之上", "bad_path")
++                            .into_response(),
++                    )
++                }
++                Some(id) => match database::get_folder(&state.db_pool, id) {
++                    Ok(Some(f)) => f.parent_id,
++                    Ok(None) => {
++                        return Err(http_error(
++                            StatusCode::NOT_FOUND,
++                            "目录不存在",
++                            "folder_not_found",
++                        )
++                        .into_response())
++                    }
++                    Err(e) => {
++                        tracing::error!("解析目录路径失败: {}", e);
++                        return Err(http_error(
++                            StatusCode::INTERNAL_SERVER_ERROR,
++                            "查询目录失败",
++                            "db_error",
++                        )
++                        .into_response());
++                    }
++                },
++            };
++            continue;
++        }
++        let (folders, _) = database::list_folder_children(&state.db_pool, cur).map_err(|e| {
++            tracing::error!("解析目录路径失败: {}", e);
++            http_error(StatusCode::INTERNAL_SERVER_ERROR, "查询目录失败", "db_error")
++                .into_response()
++        })?;
++        match folders.iter().find(|f| f.name == seg) {
++            Some(f) => cur = Some(f.id),
++            None => {
++                tracing::warn!("移动目标目录不存在: {}", seg);
++                return Err(http_error(
++                    StatusCode::NOT_FOUND,
++                    "目录不存在",
++                    "folder_not_found",
++                )
++                .into_response())
++            }
++        }
++    }
++    Ok(cur)
++}
++
+ // ------------------------------------------------------------------
+ // 路由
+ // ------------------------------------------------------------------
+@@ -585,3 +659,17 @@ pub fn router() -> Router<Arc<AppState>> {
+         )
+         .layer(middleware::from_fn(require_bot_key))
+ }
++
++/// 面板 UI 用的目录/文件管理路由（与 bot 共用同一批 handler）。
++/// 不带 X-Bot-Key 层：走全局会话鉴权（未登录返回 401）。
++pub fn panel_router() -> Router<Arc<AppState>> {
++    Router::new()
++        .route(
++            "/api/folders",
++            get(list_folder).post(create_folder),
++        )
++        .route("/api/folders/:id", delete(delete_folder_cascade))
++        .route("/api/folders/:id/rename", post(rename_folder))
++        .route("/api/files/:file_id/move", post(move_file))
++        .route("/api/files/:file_id/rename", patch(rename_file))
++}
+diff --git a/src/routes/mod.rs b/src/routes/mod.rs
+index 56e6910..a760544 100644
+--- a/src/routes/mod.rs
++++ b/src/routes/mod.rs
+@@ -18,6 +18,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
+         .merge(api_auth::router())
+         .merge(api_files::router())
+         .merge(api_bot::router())
++        .merge(api_bot::panel_router())
+         .merge(api_upload::router())
+         .merge(api_settings::router())
+         .merge(api_sse::router())
