@@ -31,6 +31,7 @@ jobs:
         env:
           PAYLOAD_URL: ${{ github.event.client_payload.url || inputs.url }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          TARGET_FOLDER_ID: ${{ github.event.client_payload.target_folder_id }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -57,6 +58,7 @@ jobs:
               f.write(f"scheme={p.scheme}\n")
           PY
           echo "chat_id=$CHAT_ID" >> "$GITHUB_OUTPUT"
+          echo "target_folder_id=${TARGET_FOLDER_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Install Gopeed Web
         run: |
@@ -266,7 +268,44 @@ jobs:
           short_id=$(jq -er '.short_id' upload_resp.txt)
           share_url="$base/d/$short_id"
           echo "share_url=$share_url" >> "$GITHUB_OUTPUT"
+          echo "short_id=$short_id" >> "$GITHUB_OUTPUT"
           echo "上传完成：$share_url"
+
+      - name: Move to target folder
+        id: move
+        if: success()
+        env:
+          TGSTATE_URL: ${{ secrets.TGSTATE_URL }}
+          BOT_API_KEY: ${{ secrets.BOT_API_KEY }}
+          SHORT_ID: ${{ steps.upload.outputs.short_id }}
+          TARGET_FOLDER_ID: ${{ steps.prep.outputs.target_folder_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SHORT_ID" ] || [ -z "$TARGET_FOLDER_ID" ]; then
+            echo "无目标目录（根目录派发或手动触发），文件保留在根目录"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BOT_API_KEY" ]; then
+            echo "::warning::secret BOT_API_KEY 未配置，无法自动归档，文件暂存根目录"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${TGSTATE_URL//[[:space:]]/}"
+          base="${base%/}"
+          code=$(curl -sS -o move_resp.txt -w '%{http_code}' \
+            -X POST \
+            -H "X-Bot-Key: $BOT_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"target_folder_id\": $TARGET_FOLDER_ID}" \
+            "$base/api/bot/files/$SHORT_ID/move") || code=000
+          if [ "$code" = "200" ]; then
+            echo "文件已归档到目标目录（folder_id=$TARGET_FOLDER_ID）"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::移动到目标目录失败（HTTP $code）：$(head -c 500 move_resp.txt 2>/dev/null || true)"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Send result to Telegram
         if: success()
@@ -276,6 +315,8 @@ jobs:
           SHARE_URL: ${{ steps.upload.outputs.share_url }}
           FILENAME: ${{ steps.download.outputs.filename }}
           SIZE: ${{ steps.download.outputs.size }}
+          MOVED: ${{ steps.move.outputs.moved }}
+          TARGET_FOLDER_PATH: ${{ github.event.client_payload.target_folder_path }}
         run: |
           set -euo pipefail
           if [ -z "$CHAT_ID" ]; then
@@ -283,7 +324,15 @@ jobs:
             exit 0
           fi
           size_mb=$((SIZE / 1024 / 1024))
-          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)\n链接: %s' "$FILENAME" "$size_mb" "$SHARE_URL")
+          folder_part=""
+          if [ -n "$TARGET_FOLDER_PATH" ]; then
+            if [ "$MOVED" = "true" ]; then
+              folder_part=$'\n'"目录: /${TARGET_FOLDER_PATH}"
+            else
+              folder_part=$'\n'"目录: /${TARGET_FOLDER_PATH}（自动归档失败，暂存根目录，可 /mv 手动移动）"
+            fi
+          fi
+          text=$(printf '[OK] 任务完成\n文件: %s (%s MB)%s\n链接: %s' "$FILENAME" "$size_mb" "$folder_part" "$SHARE_URL")
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" > /dev/null
