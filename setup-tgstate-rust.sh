@@ -34,12 +34,28 @@ fi
 
 cd "$DIR"
 
-# 2. 切到补丁基线
-echo "==> 切到基线 $BASE (v2.1.7)"
+# 2. 强制回到干净的补丁基线
+#    注意：单靠 git checkout <commit> 无法保证可重复执行，它有两个盲区：
+#      a) 已经处于该提交时，checkout 是空操作，不会丢弃上次打补丁留下的改动；
+#      b) 不会删除补丁新增的未跟踪文件（如补丁 4 新建的 src/routes/api_bot.rs）。
+#    残留会让后续 git apply 失败（补丁 3、4 改同一批文件），脚本就会误报
+#    「无法应用，上游代码可能已变动」。所以必须 --force 丢弃改动 + clean 删残留。
+#    git clean 默认不动 .gitignore 里的文件，所以 target/、.env、*.db 都不会被删。
+echo "==> 切到基线 $BASE (v2.1.7)，并清理上次的补丁残留"
 git fetch --tags --quiet origin || true
-git checkout --quiet "$BASE"
+git checkout --quiet --force "$BASE"
+git clean --quiet -fd
 
-# 3. 按文件名顺序打全部补丁（可重复执行）
+# 2b. 断言工作树确实干净，否则后面的 apply 只会报出误导性的错误
+dirty=$(git status --porcelain)
+if [ -n "$dirty" ]; then
+  echo "==> 清理后工作树仍不干净，无法安全打补丁：" >&2
+  echo "$dirty" >&2
+  exit 1
+fi
+
+# 3. 按文件名顺序打全部补丁
+#    此时已保证是干净基线，补丁应全部正向应用。
 #    「已在位」用反向应用检测：补丁已生效时 forward check 会失败、reverse check 成功。
 for pf in ../patches/*.patch; do
   name=$(basename "$pf")
