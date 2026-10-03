@@ -16,6 +16,13 @@ const RMDIR_CONFIRM_TTL_MS = 60000;
 const MESSAGE_MAX_CHARS = 3500;
 const SHORT_ID_RE = /^[A-Za-z0-9]{10}$/;
 
+// 每个会话的当前目录（规范化路径，根 = ""）。bot 重启后回到根目录。
+const userCwd = new Map(); // chatId -> path
+
+function cwdOf(chatId) {
+  return userCwd.get(chatId) || "";
+}
+
 const HELP_TEXT = [
   "下载机器人使用方法：",
   "",
@@ -26,18 +33,21 @@ const HELP_TEXT = [
   "",
   "机器人把任务提交到 GitHub Actions，用 Gopeed 下载后上传 Telegram 频道，分享链接发回本会话。",
   "支持一次粘贴多条链接（换行分隔），每条链接独立排队处理。",
+  "在某个目录里（/cd 后）发链接，下载完成的文件自动存入该目录。",
   "",
   "2) 文件管理命令（管理 tgstate 网盘）：",
-  "/ls [目录路径]            浏览目录，如 /ls 或 /ls 影视/2026",
-  "/mkdir <目录路径>         创建目录（支持多级，如 /mkdir 影视/剧集）",
-  "/mv <文件> [目标目录]     移动文件，省略目标目录 = 移到根目录",
+  "/pwd                      查看当前目录",
+  "/cd [目录路径]            切换当前目录，/cd / 回根目录",
+  "/ls [目录路径]            浏览目录，省略 = 当前目录",
+  "/mkdir <目录路径>         创建目录（相对当前目录，支持多级）",
+  "/mv <文件> [目标目录]     移动文件，省略目标 = 当前目录，/ = 根目录",
   "/rename <文件> <新文件名> 重命名文件（short_id 与分享链接保持不变）",
   "/rm <文件>                删除单个文件",
   "/rmdir <目录路径>         级联删除目录，需 60 秒内发送 /rmdir confirm <路径> 二次确认",
   "/help                     查看本说明",
   "",
-  "文件参数写法：10 位 short_id（如 aBc123XyZ9），或 路径/文件名（如 影视/EP01.mkv）。",
-  "目录名称匹配大小写不敏感；路径各层用 / 分隔。",
+  "文件参数写法：10 位 short_id（如 aBc123XyZ9），或 路径/文件名（如 EP01.mkv）。",
+  "路径以 / 开头表示从根目录开始，否则相对当前目录；名称匹配大小写不敏感。",
 ].join("\n");
 
 function requireEnv(name) {
@@ -183,14 +193,17 @@ function renderListing(data, pathLabel) {
   return lines.join("\n");
 }
 
-function validateRmdirConfirm(pending, inputPath) {
+function validateRmdirConfirm(pending, inputPath, cwdPath = "") {
   if (!pending) {
     return { ok: false, message: "没有待确认的 /rmdir 操作。用法：/rmdir <目录路径>" };
   }
   if (Date.now() > pending.expiresAt) {
     return { ok: false, message: "确认已超时（60 秒），请重新发起 /rmdir。" };
   }
-  const norm = normalizePath(inputPath);
+  const raw = normalizePath(inputPath);
+  // 待确认路径是绝对的；confirm 输入按「原样」或「相对当前目录」两种写法宽容匹配。
+  const withCwd = normalizePath(`${normalizePath(cwdPath)}/${raw}`);
+  const norm = raw === pending.path ? raw : withCwd === pending.path ? withCwd : raw;
   if (norm !== pending.path) {
     return {
       ok: false,
@@ -208,9 +221,10 @@ function listUrl(parentId) {
   return `/api/bot/folders${parentId != null ? `?parent_id=${parentId}` : ""}`;
 }
 
-async function resolveFolderParts(parts) {
-  let parentId = null;
-  const walked = [];
+// 从指定起点逐层下钻。baseId=null 表示根目录；baseParts 用于错误提示里的完整路径。
+async function walkFolders(baseId, baseParts, parts) {
+  let parentId = baseId;
+  const walked = [...baseParts];
   for (const part of parts) {
     const res = await tgApiJson(listUrl(parentId));
     if (!res.ok) return { ok: false, message: mapTgError(res) };
@@ -234,23 +248,37 @@ async function resolveFolderParts(parts) {
   return { ok: true, id: parentId, path: walked.join("/") };
 }
 
-async function resolvePath(pathInput) {
-  const clean = normalizePath(pathInput);
-  if (!clean) return { ok: true, id: null, path: "" };
-  return resolveFolderParts(clean.split("/").filter(Boolean));
+// 目录路径解析。pathInput 以 / 开头 = 绝对路径（从根开始）；
+// 否则相对 cwdPath 解析。空输入 = cwdPath 本身（根目录时 id 为 null）。
+async function resolvePath(pathInput, cwdPath = "") {
+  const raw = String(pathInput || "").trim();
+  const cwd = normalizePath(cwdPath);
+  if (!raw) {
+    if (!cwd) return { ok: true, id: null, path: "" };
+    return walkFolders(null, [], cwd.split("/").filter(Boolean));
+  }
+  const parts = normalizePath(raw).split("/").filter(Boolean);
+  if (raw.startsWith("/")) return walkFolders(null, [], parts);
+  const baseParts = cwd.split("/").filter(Boolean);
+  if (baseParts.length === 0) return walkFolders(null, [], parts);
+  const base = await walkFolders(null, [], baseParts);
+  if (!base.ok) return base;
+  return walkFolders(base.id, baseParts, parts);
 }
 
 // 文件参数解析：10 位 short_id 直接命中；否则按「目录路径/文件名」逐层解析后
-// 在目标目录的文件清单里做大小写不敏感匹配。
-async function findFile(arg) {
-  const clean = normalizePath(arg);
+// 在目标目录的文件清单里做大小写不敏感匹配。相对路径基于 cwdPath。
+async function findFile(arg, cwdPath = "") {
+  const raw = String(arg || "").trim();
+  const clean = normalizePath(raw);
   if (!clean) return { error: "请提供文件参数：short_id 或 路径/文件名" };
   if (SHORT_ID_RE.test(clean)) {
     return { shortId: clean, filename: clean, folderPath: "" };
   }
   const parts = clean.split("/").filter(Boolean);
   const name = parts.pop();
-  const dir = await resolveFolderParts(parts);
+  const dirInput = raw.startsWith("/") ? `/${parts.join("/")}` : parts.join("/");
+  const dir = await resolvePath(dirInput, cwdPath);
   if (!dir.ok) return { error: dir.message };
   const res = await tgApiJson(listUrl(dir.id));
   if (!res.ok) return { error: mapTgError(res) };
@@ -281,7 +309,7 @@ async function findFile(arg) {
 const pendingRmdir = new Map(); // chatId -> { path, expiresAt }
 
 async function cmdLs(chatId, args) {
-  const target = await resolvePath(args);
+  const target = await resolvePath(args, cwdOf(chatId));
   if (!target.ok) return sendTelegramMessage(chatId, target.message);
   const res = await tgApiJson(listUrl(target.id));
   if (!res.ok) return sendTelegramMessage(chatId, mapTgError(res));
@@ -291,13 +319,46 @@ async function cmdLs(chatId, args) {
   );
 }
 
+async function cmdPwd(chatId) {
+  const cwd = cwdOf(chatId);
+  await sendTelegramMessage(chatId, `当前目录：/${cwd}`);
+}
+
+async function cmdCd(chatId, args) {
+  const raw = String(args || "").trim();
+  if (!raw || raw === "/") {
+    userCwd.set(chatId, "");
+    return sendTelegramMessage(chatId, "当前目录：/");
+  }
+  const target = await resolvePath(raw, cwdOf(chatId));
+  if (!target.ok) return sendTelegramMessage(chatId, target.message);
+  userCwd.set(chatId, target.path);
+  await sendTelegramMessage(
+    chatId,
+    `当前目录：/${target.path}\n（此后发下载链接，文件将存入此目录；/cd / 回根目录）`
+  );
+}
+
 async function cmdMkdir(chatId, args) {
-  const parts = normalizePath(args).split("/").filter(Boolean);
+  const raw = String(args || "").trim();
+  if (!raw) {
+    return sendTelegramMessage(chatId, "用法：/mkdir 目录路径（支持多级，如 /mkdir 影视/剧集）");
+  }
+  const parts = normalizePath(raw).split("/").filter(Boolean);
   if (parts.length === 0) {
     return sendTelegramMessage(chatId, "用法：/mkdir 目录路径（支持多级，如 /mkdir 影视/剧集）");
   }
   let parentId = null;
-  const walked = [];
+  let walked = [];
+  if (!raw.startsWith("/")) {
+    const baseParts = cwdOf(chatId).split("/").filter(Boolean);
+    if (baseParts.length > 0) {
+      const base = await walkFolders(null, [], baseParts);
+      if (!base.ok) return sendTelegramMessage(chatId, base.message);
+      parentId = base.id;
+      walked = baseParts;
+    }
+  }
   for (const part of parts) {
     const res = await tgApiJson(listUrl(parentId));
     if (!res.ok) return sendTelegramMessage(chatId, mapTgError(res));
@@ -324,14 +385,12 @@ async function cmdMkdir(chatId, args) {
 async function cmdMv(chatId, args) {
   const parts = args.split(/\s+/).filter(Boolean);
   if (parts.length === 0) {
-    return sendTelegramMessage(chatId, "用法：/mv <文件> [目标目录]（省略目标目录 = 移到根目录）");
+    return sendTelegramMessage(chatId, "用法：/mv <文件> [目标目录]（省略目标 = 当前目录，/ = 根目录）");
   }
-  const file = await findFile(parts[0]);
+  const file = await findFile(parts[0], cwdOf(chatId));
   if (file.error) return sendTelegramMessage(chatId, file.error);
   const targetRaw = parts.slice(1).join(" ");
-  const target = targetRaw
-    ? await resolvePath(targetRaw)
-    : { ok: true, id: null, path: "" };
+  const target = await resolvePath(targetRaw, cwdOf(chatId));
   if (!target.ok) return sendTelegramMessage(chatId, target.message);
   const res = await tgApiJson(`/api/bot/files/${encodeURIComponent(file.shortId)}/move`, {
     method: "POST",
@@ -349,7 +408,7 @@ async function cmdRename(chatId, args) {
   if (parts.length < 2) {
     return sendTelegramMessage(chatId, "用法：/rename <文件> <新文件名>");
   }
-  const file = await findFile(parts[0]);
+  const file = await findFile(parts[0], cwdOf(chatId));
   if (file.error) return sendTelegramMessage(chatId, file.error);
   const newName = parts.slice(1).join(" ").trim();
   if (!newName || newName.includes("/") || newName.includes("\\")) {
@@ -370,7 +429,7 @@ async function cmdRm(chatId, args) {
   if (!args.trim()) {
     return sendTelegramMessage(chatId, "用法：/rm <文件>");
   }
-  const file = await findFile(args.trim());
+  const file = await findFile(args.trim(), cwdOf(chatId));
   if (file.error) return sendTelegramMessage(chatId, file.error);
   const res = await tgApiJson(`/api/bot/files/${encodeURIComponent(file.shortId)}`, {
     method: "DELETE",
@@ -392,7 +451,7 @@ async function cmdRmdir(chatId, args) {
   const confirmMatch = /^confirm(?:\s+([\s\S]+))?$/.exec(raw);
   if (confirmMatch) {
     const pending = pendingRmdir.get(chatId);
-    const check = validateRmdirConfirm(pending, confirmMatch[1] || "");
+    const check = validateRmdirConfirm(pending, confirmMatch[1] || "", cwdOf(chatId));
     if (!check.ok) return sendTelegramMessage(chatId, check.message);
     pendingRmdir.delete(chatId);
     const target = await resolvePath(pending.path);
@@ -427,7 +486,7 @@ async function cmdRmdir(chatId, args) {
       "用法：/rmdir <目录路径>（级联删除该目录下全部子目录与文件，需二次确认）"
     );
   }
-  const target = await resolvePath(raw);
+  const target = await resolvePath(raw, cwdOf(chatId));
   if (!target.ok) return sendTelegramMessage(chatId, target.message);
   if (target.id == null) {
     return sendTelegramMessage(chatId, "根目录不可删除。");
@@ -436,21 +495,23 @@ async function cmdRmdir(chatId, args) {
   if (!res.ok) return sendTelegramMessage(chatId, mapTgError(res));
   const fileCount = ((res.data && res.data.files) || []).length;
   pendingRmdir.set(chatId, {
-    path: normalizePath(raw),
+    path: target.path,
     expiresAt: Date.now() + RMDIR_CONFIRM_TTL_MS,
   });
   await sendTelegramMessage(
     chatId,
     [
-      `将级联删除 /${normalizePath(raw)}`,
+      `将级联删除 /${target.path}`,
       `（直接包含 ${fileCount} 个文件，子目录一并删除；目录内文件的分享链接将失效）`,
-      `确认请在 60 秒内发送：/rmdir confirm /${normalizePath(raw)}`,
+      `确认请在 60 秒内发送：/rmdir confirm /${target.path}`,
     ].join("\n")
   );
 }
 
 const COMMANDS = {
   ls: cmdLs,
+  pwd: cmdPwd,
+  cd: cmdCd,
   mkdir: cmdMkdir,
   mv: cmdMv,
   rename: cmdRename,
@@ -509,7 +570,9 @@ function extractUrls(text) {
   return urls;
 }
 
-async function dispatchDownload(url, chatId) {
+// 派发下载任务。folder: { targetFolderId, targetFolderPath } —— 派发那一刻
+// 的当前目录；workflow 上传完成后把文件 move 进去。targetFolderId=null 表示根目录。
+async function dispatchDownload(url, chatId, folder = { targetFolderId: null, targetFolderPath: "" }) {
   return fetch(`${GITHUB_API}/repos/${getEnv().GITHUB_REPO}/dispatches`, {
     method: "POST",
     headers: {
@@ -524,9 +587,22 @@ async function dispatchDownload(url, chatId) {
       client_payload: {
         url,
         chat_id: String(chatId),
+        target_folder_id: folder.targetFolderId,
+        target_folder_path: folder.targetFolderPath,
       },
     }),
   });
+}
+
+// 把当前目录解析成 { targetFolderId, targetFolderPath }；目录已消失时回落根目录。
+async function resolveDispatchFolder(chatId) {
+  const cwd = cwdOf(chatId);
+  if (!cwd) return { targetFolderId: null, targetFolderPath: "" };
+  const base = await walkFolders(null, [], cwd.split("/").filter(Boolean));
+  if (!base.ok) {
+    return { targetFolderId: null, targetFolderPath: "" };
+  }
+  return { targetFolderId: base.id, targetFolderPath: base.path };
 }
 
 async function handleUpdate(update) {
@@ -573,10 +649,15 @@ async function handleUpdate(update) {
 
   const submitted = [];
   const failed = [];
+  const folder = await resolveDispatchFolder(chatId);
+  const folderNote =
+    folder.targetFolderPath != null && folder.targetFolderPath !== ""
+      ? `\n下载完成后将存入：/${folder.targetFolderPath}`
+      : "";
   for (const url of urls) {
     let resp;
     try {
-      resp = await dispatchDownload(url, chatId);
+      resp = await dispatchDownload(url, chatId, folder);
     } catch (e) {
       failed.push(`${describeUrl(url)}\n    网络错误：${e.message}`);
       continue;
@@ -593,7 +674,7 @@ async function handleUpdate(update) {
   const lines = [];
   if (submitted.length > 0) {
     lines.push(
-      `已提交 ${submitted.length} 个任务，GitHub Actions 排队处理中（完成后分享链接会逐条发到这里）：`,
+      `已提交 ${submitted.length} 个任务，GitHub Actions 排队处理中（完成后分享链接会逐条发到这里）：${folderNote}`,
       ...submitted.map((u) => `· ${describeUrl(u)}`)
     );
   }
@@ -667,6 +748,7 @@ export {
   resolvePath,
   tgApiJson,
   validateRmdirConfirm,
+  walkFolders,
 };
 
 const invokedDirectly =
