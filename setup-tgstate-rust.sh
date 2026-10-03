@@ -60,8 +60,11 @@ if grep -q "fn max_upload_body_size" src/constants.rs \
   && grep -q 'contains("too many requests")' src/telegram/service.rs \
   && grep -q "fn global_upload_semaphore" src/telegram/service.rs \
   && grep -q "CREATE TABLE IF NOT EXISTS folders" src/database.rs \
-  && grep -q "fn require_bot_key" src/routes/api_bot.rs; then
-  echo "==> 自检通过：10GiB 上限 + flood 变体重试 + 全局闸 + 文件夹/bot 管理面"
+  && grep -q "fn require_bot_key" src/routes/api_bot.rs \
+  && grep -q "fn panel_router" src/routes/api_bot.rs \
+  && grep -q "/api/folders" src/routes/api_bot.rs \
+  && grep -q "folder-grid" app/templates/index.html; then
+  echo "==> 自检通过：10GiB 上限 + flood 变体重试 + 全局闸 + 文件夹/bot 管理面 + 网页目录管理"
 else
   echo "==> 自检失败：补丁未正确生效" >&2
   exit 1
