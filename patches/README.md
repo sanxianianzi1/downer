@@ -140,3 +140,31 @@ handler 在 `api_bot.rs` 内与 `/api/bot/*` 共用（单一实现两处挂载�
 
 浏览器登录面板 → 文件管理页应出现面包屑与「+ 新建目录」；
 或 `curl -b <登录cookie> http://127.0.0.1:8000/api/folders`。
+
+## tgstate-rust-quark-cookie.patch
+
+加运行期凭据 KV 存储（`kv_store` 表）与两个 bot 面端点，支撑
+「TG 里 /setcookie 补夸克 Cookie → workflow 下载前实时取用」的闭环，
+彻底绕开 GitHub Secret 的手动更新。
+
+- 基线：上游 `bf4253a`（v2.1.7）+ 前四个补丁
+- 改动：`src/database.rs`（+45：kv_store 表 + kv_get/kv_set）、
+  `src/routes/api_bot.rs`（+60）
+- 无新增环境变量；数据库新表 `kv_store(key, value, updated_at)`，自动创建
+
+### 端点（X-Bot-Key 鉴权）
+
+| 方法 | 路径 | 作用 |
+|------|------|------|
+| GET | /api/bot/quark-cookie | 读 Cookie `{cookie: string \| null}` |
+| POST | /api/bot/quark-cookie | 写 Cookie `{cookie}`；空串 = 清除；上限 8KB |
+
+### 配套（不在本补丁内）
+
+- bot-worker：/setcookie（写 + 自动重试最近任务）、/retry（手动重试）
+- workflow：Validate link 步骤优先从 tgstate 拉 Cookie，回落 Secret GOPEED_COOKIE；
+  失败通知在预检 412/403 时提示 /setcookie 补法
+
+### 验证
+
+    curl -s -H "X-Bot-Key: $TGSTATE_BOT_KEY" http://127.0.0.1:8000/api/bot/quark-cookie
