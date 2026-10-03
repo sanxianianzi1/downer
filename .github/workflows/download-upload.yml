@@ -11,9 +11,9 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: download-task
-  cancel-in-progress: false
+# 并发说明：曾用 concurrency 锁串行下载（防双 10GB 任务爆 runner 磁盘 ~14GB）。
+# 现恢复并行：多个下载任务同时跑。注意两个超大文件同时下载仍可能撑爆磁盘，
+# 大文件（>5GB）建议错开发送。
 
 env:
   # 单个任务体积上限（GB）。GitHub 托管 runner 可用磁盘约 14GB。
@@ -32,6 +32,9 @@ jobs:
           PAYLOAD_URL: ${{ github.event.client_payload.url || inputs.url }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           TARGET_FOLDER_ID: ${{ github.event.client_payload.target_folder_id }}
+          TGSTATE_URL: ${{ secrets.TGSTATE_URL }}
+          BOT_API_KEY: ${{ secrets.BOT_API_KEY }}
+          SECRET_COOKIE: ${{ secrets.GOPEED_COOKIE }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -60,6 +63,27 @@ jobs:
           echo "chat_id=$CHAT_ID" >> "$GITHUB_OUTPUT"
           echo "target_folder_id=${TARGET_FOLDER_ID}" >> "$GITHUB_OUTPUT"
 
+          # Cookie 来源：bot /setcookie 存入 tgstate 数据库的为最新（优先），
+          # 取不到时回落 Secret GOPEED_COOKIE。TGSTATE_URL 指向公网可达的 tgstate。
+          base="${TGSTATE_URL//[[:space:]]/}"
+          vps_cookie=""
+          if [ -n "$BOT_API_KEY" ] && [ -n "$base" ]; then
+            vps_cookie=$(curl -fsS --max-time 10 \
+              -H "X-Bot-Key: $BOT_API_KEY" \
+              "$base/api/bot/quark-cookie" 2>/dev/null | jq -r '.cookie // empty' || true)
+          fi
+          if [ -n "$vps_cookie" ]; then
+            echo "Cookie 来源：tgstate 数据库（长度 ${#vps_cookie}）"
+          else
+            echo "::warning::tgstate 数据库无 Cookie（bot /setcookie 可设置），回落使用 Secret GOPEED_COOKIE"
+            vps_cookie="$SECRET_COOKIE"
+          fi
+          {
+            echo "cookie<<COOKIE_EOF"
+            echo "$vps_cookie"
+            echo "COOKIE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Install Gopeed Web
         run: |
           set -euo pipefail
@@ -73,7 +97,7 @@ jobs:
         env:
           DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
           DOWNLOAD_SCHEME: ${{ steps.prep.outputs.scheme }}
-          GOPEED_COOKIE: ${{ secrets.GOPEED_COOKIE }}
+          GOPEED_COOKIE: ${{ steps.prep.outputs.cookie }}
           GOPEED_HEADERS: ${{ secrets.GOPEED_HEADERS }}
         run: |
           set -euo pipefail
@@ -100,9 +124,11 @@ jobs:
             case "$code" in
               200|206|416) ;;
               412|403)
-                echo "::warning::直链预检 HTTP $code：通常表示 Cookie 无效或过期。仍继续 Gopeed 下载；若失败请更新 Secret GOPEED_COOKIE"
+                echo "precheck_code=$code" >> "$GITHUB_OUTPUT"
+                echo "::warning::直链预检 HTTP $code：通常表示 Cookie 无效或过期。仍继续 Gopeed 下载；若失败请更新 Cookie（TG 发 /setcookie <新Cookie>）"
                 ;;
               *)
+                echo "precheck_code=$code" >> "$GITHUB_OUTPUT"
                 echo "::warning::直链预检 HTTP $code（重试后仍失败）。仍继续 Gopeed 下载"
                 ;;
             esac
@@ -347,6 +373,7 @@ jobs:
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           DOWNLOAD_URL: ${{ steps.prep.outputs.url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRECHECK_CODE: ${{ steps.download.outputs.precheck_code }}
         run: |
           set -euo pipefail
           if [ -z "$CHAT_ID" ]; then
@@ -357,7 +384,13 @@ jobs:
           if [ -n "$DOWNLOAD_URL" ]; then
             link_part=$'\n'"链接: ${DOWNLOAD_URL}"
           fi
-          text=$(printf '[FAIL] 任务失败，查看日志: %s%s' "$RUN_URL" "$link_part")
+          cookie_hint=""
+          if [ "$PRECHECK_CODE" = "412" ] || [ "$PRECHECK_CODE" = "403" ]; then
+            cookie_hint=$'\n\n'"疑似夸克 Cookie 失效。补法：浏览器登录 pan.quark.cn → F12 → 网络 → 任一请求的请求头复制完整 cookie 值，然后发给机器人："$'\n'"/setcookie <粘贴Cookie>"$'\n'"发送后会自动重试本任务，无需手动重发链接。"
+          else
+            cookie_hint=$'\n\n'"若反复失败，可尝试 /setcookie 更新夸克 Cookie 后发 /retry 重试。"
+          fi
+          text=$(printf '[FAIL] 任务失败，查看日志: %s%s%s' "$RUN_URL" "$link_part" "$cookie_hint")
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" > /dev/null || true
