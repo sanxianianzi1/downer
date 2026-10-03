@@ -111,6 +111,17 @@
 **/.env
 **/.env.local
 **/.env.*.local
+# .env 的备份/临时副本（注意：上面的 *.bak 只匹配 .bak 结尾，
+# 盖不住 .env.bak-<hash> 这种命名，曾导致密钥备份差点被提交）
+**/.env.bak*
+**/.env.*.bak
+**/.env-*
+**/.env.old
+**/.env.*.old
+**/.env.orig
+**/.env.*.orig
+**/.env.save
+**/.env.*.save
 
 # Cloned on the VPS, not part of this repo
 tgstate-rust/
