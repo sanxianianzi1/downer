@@ -1,0 +1,58 @@
+diff --git a/app/static/js/main.js b/app/static/js/main.js
+index e220150..04e24dd 100644
+--- a/app/static/js/main.js
++++ b/app/static/js/main.js
+@@ -412,6 +412,34 @@ document.addEventListener('DOMContentLoaded', () => {
+         } catch (e) { Toast.show('网络错误', 'error'); }
+     });
+ 
++    const batchMove = document.getElementById('batch-move-btn');
++    if (batchMove) batchMove.addEventListener('click', async () => {
++        const items = sel();
++        if (!items.length) return;
++        const target = await Modal.prompt('批量移动',
++            '将选中的 ' + items.length + ' 个文件移动到目标目录。输入目录路径：/ 表示根目录，/影视/2026 表示逐层目录。',
++            { placeholder: '/', okText: '移动' });
++        if (target === null) return;
++        const ids = items.map((c) => c.dataset.fileId).filter(Boolean);
++        let done = 0, fail = 0;
++        for (const id of ids) {
++            try {
++                const { ok } = await apiJson('/api/files/' + encodeURIComponent(id) + '/move', {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ target_path: target }),
++                });
++                if (ok) done++; else fail++;
++            } catch (e) { fail++; }
++        }
++        if (fail) {
++            Toast.show('移动完成：' + done + ' 成功，' + fail + ' 失败', 'error');
++            setTimeout(() => location.reload(), 1500);
++        } else {
++            location.reload();
++        }
++    });
++
+     // ---- 上传 ----
+     if (zone && picker) {
+         picker.addEventListener('click', (e) => e.stopPropagation());
+diff --git a/app/templates/index.html b/app/templates/index.html
+index 9397e2a..391e076 100644
+--- a/app/templates/index.html
++++ b/app/templates/index.html
+@@ -58,6 +58,7 @@
+         <span class="text-sm" style="font-weight:600;"><span id="selection-counter">0</span> 项已选</span>
+         <div class="row">
+             <button id="copy-links-btn" class="btn btn-secondary btn-sm">复制链接</button>
++            <button id="batch-move-btn" class="btn btn-secondary btn-sm">移动</button>
+             <button id="batch-delete-btn" class="btn btn-danger btn-sm">删除</button>
+         </div>
+     </div>
+@@ -113,5 +114,5 @@
+     {% endif %}
+ </div>
+ <script>window.__CURRENT_FOLDER__ = "{{ current_folder_id | default(value='') }}";</script>
+-<script src="/static/js/main.js?v=5.7"></script>
++<script src="/static/js/main.js?v=5.8"></script>
+ {% endblock %}
