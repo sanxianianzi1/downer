@@ -1,0 +1,132 @@
+diff --git a/src/database.rs b/src/database.rs
+index f2f4244..2e185fe 100644
+--- a/src/database.rs
++++ b/src/database.rs
+@@ -88,6 +88,15 @@ pub fn init_db(data_dir: &str) -> DbPool {
+     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);")
+         .ok();
+ 
++    conn.execute_batch(
++        "CREATE TABLE IF NOT EXISTS kv_store (
++            key TEXT PRIMARY KEY,
++            value TEXT NOT NULL,
++            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++        );",
++    )
++    .expect("Failed to create kv_store table");
++
+     let has_folder_id: bool = conn
+         .prepare("PRAGMA table_info(files)")
+         .unwrap()
+@@ -634,3 +643,36 @@ pub fn delete_folders_by_ids(pool: &DbPool, ids: &[i64]) -> Result<usize, AppErr
+     }
+     Ok(deleted)
+ }
++
++// ------------------------------------------------------------------
++// 通用 KV 存储（kv_store 表）：目前存放夸克直链 Cookie 等运行期凭据
++// ------------------------------------------------------------------
++
++/// 读 KV；键不存在返回 None。
++pub fn kv_get(pool: &DbPool, key: &str) -> Result<Option<String>, AppErrorKind> {
++    let conn = pool.get()?;
++    let result: Result<String, rusqlite::Error> =
++        conn.query_row("SELECT value FROM kv_store WHERE key = ?1", params![key], |row| {
++            row.get(0)
++        });
++    match result {
++        Ok(v) => Ok(Some(v)),
++        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
++        Err(e) => Err(e.into()),
++    }
++}
++
++/// 写 KV（UPSERT）；空值写入等于删除。
++pub fn kv_set(pool: &DbPool, key: &str, value: &str) -> Result<(), AppErrorKind> {
++    let conn = pool.get()?;
++    if value.is_empty() {
++        conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
++        return Ok(());
++    }
++    conn.execute(
++        "INSERT INTO kv_store (key, value) VALUES (?1, ?2)
++         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = CURRENT_TIMESTAMP",
++        params![key, value],
++    )?;
++    Ok(())
++}
+diff --git a/src/routes/api_bot.rs b/src/routes/api_bot.rs
+index 520f137..ade130b 100644
+--- a/src/routes/api_bot.rs
++++ b/src/routes/api_bot.rs
+@@ -640,6 +640,62 @@ async fn resolve_folder_path(state: &Arc<AppState>, raw: &str) -> Result<Option<
+     Ok(cur)
+ }
+ 
++// ------------------------------------------------------------------
++// 运行期凭据（夸克直链 Cookie）：bot /setcookie 写入，workflow 取用
++// ------------------------------------------------------------------
++
++#[derive(Deserialize)]
++struct QuarkCookieBody {
++    cookie: String,
++}
++
++const KV_QUARK_COOKIE: &str = "quark_cookie";
++const QUARK_COOKIE_MAX_LEN: usize = 8192;
++
++async fn get_quark_cookie(State(state): State<Arc<AppState>>) -> Response {
++    match database::kv_get(&state.db_pool, KV_QUARK_COOKIE) {
++        Ok(v) => Json(json!({ "cookie": v })).into_response(),
++        Err(e) => {
++            tracing::error!("bot 读取 Cookie 失败: {}", e);
++            http_error(StatusCode::INTERNAL_SERVER_ERROR, "读取失败", "db_error")
++                .into_response()
++        }
++    }
++}
++
++async fn set_quark_cookie(
++    State(state): State<Arc<AppState>>,
++    Json(body): Json<QuarkCookieBody>,
++) -> Response {
++    let cookie = body.cookie.trim().to_string();
++    if cookie.len() > QUARK_COOKIE_MAX_LEN {
++        return http_error(
++            StatusCode::BAD_REQUEST,
++            "Cookie 过长",
++            "cookie_too_long",
++        )
++        .into_response();
++    }
++    // 空值 = 清除；其余原样存（cookie 格式由上游保证，服务端不强校验）
++    match database::kv_set(&state.db_pool, KV_QUARK_COOKIE, &cookie) {
++        Ok(()) => {
++            let action = if cookie.is_empty() { "已清除" } else { "已更新" };
++            tracing::info!("bot 面 Quark Cookie {}", action);
++            Json(json!({
++                "status": "ok",
++                "message": format!("Cookie {}", action),
++                "cleared": cookie.is_empty(),
++            }))
++            .into_response()
++        }
++        Err(e) => {
++            tracing::error!("bot 写入 Cookie 失败: {}", e);
++            http_error(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", "db_error")
++                .into_response()
++        }
++    }
++}
++
+ // ------------------------------------------------------------------
+ // 路由
+ // ------------------------------------------------------------------
+@@ -653,6 +709,7 @@ pub fn router() -> Router<Arc<AppState>> {
+         .route("/api/bot/folders/:id", delete(delete_folder_cascade))
+         .route("/api/bot/folders/:id/rename", post(rename_folder))
+         .route("/api/bot/files/:file_id/move", post(move_file))
++        .route("/api/bot/quark-cookie", get(get_quark_cookie).post(set_quark_cookie))
+         .route(
+             "/api/bot/files/:file_id",
+             patch(rename_file).delete(delete_file_bot),
