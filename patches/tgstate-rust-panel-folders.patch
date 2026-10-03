@@ -644,15 +644,3 @@ index 56e6910..a760544 100644
          .merge(api_upload::router())
          .merge(api_settings::router())
          .merge(api_sse::router())
-diff --git a/src/routes/pages.rs b/src/routes/pages.rs
-index 732ad06..0cfc741 100644
---- a/src/routes/pages.rs
-+++ b/src/routes/pages.rs
-@@ -68,6 +68,7 @@ fn enrich_files(files: &[database::FileMetadata]) -> Vec<serde_json::Value> {
-                 "upload_date_short": upload_date_short,
-                 "display_id": display_id,
-                 "has_password": f.has_share_password(),
-+                "folder_id": f.folder_id,
-             })
-         })
-         .collect()
