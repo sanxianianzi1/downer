@@ -92,3 +92,48 @@ axum 的 `DefaultBodyLimit` 在**读取请求体阶段**就中断连接，早于
 ### 验证
 
     curl -s -H "X-Bot-Key: $TGSTATE_BOT_KEY" http://127.0.0.1:8000/api/bot/folders
+
+## tgstate-rust-panel-folders.patch
+
+给**网页面板**加上目录管理：浏览、新建、改名、级联删除、文件移动/改名。
+与 bot 管理面共用同一套 `folders` 数据，两端互通。
+
+- 基线：上游 `bf4253a`（v2.1.7）+ 前三个补丁
+- 改动：`src/routes/api_bot.rs`（+94）、`src/database.rs`（+11）、
+  `src/routes/mod.rs`（+1）、`app/templates/index.html`、`app/static/js/main.js`（+255）、
+  `app/static/css/style.css`（+94）
+- 无新增环境变量、无新增数据库迁移（复用第三补丁的 `folders` 表）
+
+### 功能（网页 · 文件管理页）
+
+- 面包屑导航 + 目录卡片网格：点击进入子目录，点面包屑回退
+- 「+ 新建目录」：在当前目录下创建
+- 目录卡片：改名、删除（级联确认后真删，TG 无回收站）
+- 文件行新增「移动到目录」「改名」按钮
+- 移动支持路径语义：`/` = 根目录，`/影视/2026` = 逐层目录（服务端解析，与 bot 的 /mv 一致）
+
+### API（复用 bot 的 handler，走面板会话鉴权，未登录 401）
+
+| 方法 | 路径 | 作用 |
+|------|------|------|
+| GET | /api/folders?parent_id=N | 列子目录+文件（省略 parent_id = 根） |
+| POST | /api/folders | 建目录 {name, parent_id?} |
+| POST | /api/folders/:id/rename | 目录改名 {name} |
+| DELETE | /api/folders/:id | 级联删除（与 bot 同流程，返回失败清单） |
+| POST | /api/files/:file_id/move | 移动 {target_folder_id?} 或 {target_path?} |
+| PATCH | /api/files/:file_id/rename | 文件改名 {filename} |
+
+handler 在 `api_bot.rs` 内与 `/api/bot/*` 共用（单一实现两处挂载），
+面板路由不挂 X-Bot-Key 层，由全局会话中间件保护。
+`/api/files` 与列表接口的文件对象新增 `folder_id` 字段。
+
+### 注意
+
+- 页面刷新后目录视图从根目录开始（SSR 仍渲染全量列表，JS 加载后覆盖为根目录视图）
+- 搜索框仅过滤当前目录视图内的行
+- 部署后浏览器需强刷（模板版本号已升到 `?v=5.6`）
+
+### 验证
+
+浏览器登录面板 → 文件管理页应出现面包屑与「+ 新建目录」；
+或 `curl -b <登录cookie> http://127.0.0.1:8000/api/folders`。
