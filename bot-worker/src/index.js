@@ -18,6 +18,8 @@ const SHORT_ID_RE = /^[A-Za-z0-9]{10}$/;
 
 // 每个会话的当前目录（规范化路径，根 = ""）。bot 重启后回到根目录。
 const userCwd = new Map(); // chatId -> path
+// chatId -> 最近一次成功派发的 { url, folder }；/setcookie 成功后自动重派，/retry 手动重派
+const lastDispatch = new Map();
 
 function cwdOf(chatId) {
   return userCwd.get(chatId) || "";
@@ -44,6 +46,11 @@ const HELP_TEXT = [
   "/rename <文件> <新文件名> 重命名文件（short_id 与分享链接保持不变）",
   "/rm <文件>                删除单个文件",
   "/rmdir <目录路径>         级联删除目录，需 60 秒内发送 /rmdir confirm <路径> 二次确认",
+  "",
+  "3) Cookie 维护（夸克直链失效时用）：",
+  "/setcookie <Cookie>       更新夸克 Cookie（存 VPS 数据库），成功后自动重试上次未完成任务",
+  "/setcookie                查看 Cookie 是否已设置",
+  "/retry                    重试本会话最近一次下载任务",
   "/help                     查看本说明",
   "",
   "文件参数写法：10 位 short_id（如 aBc123XyZ9），或 路径/文件名（如 EP01.mkv）。",
@@ -445,6 +452,64 @@ async function cmdRm(chatId, args) {
   await sendTelegramMessage(chatId, lines.join("\n"));
 }
 
+// /setcookie <cookie>：更新夸克直链 Cookie（存 tgstate 数据库，workflow 每次下载前实时取用），
+// 成功后自动重派本会话最近一次下载任务。
+async function cmdSetCookie(chatId, args) {
+  const cookie = args.trim();
+  if (!cookie) {
+    const current = await tgApiJson("/api/bot/quark-cookie");
+    if (!current.ok) return sendTelegramMessage(chatId, mapTgError(current));
+    const has = !!(current.data && current.data.cookie);
+    return sendTelegramMessage(
+      chatId,
+      has
+        ? "当前已设置夸克 Cookie（内容不回显）。更新用法：/setcookie <新Cookie>"
+        : "当前未设置夸克 Cookie（将回落使用 GitHub Secret GOPEED_COOKIE）。设置用法：/setcookie <Cookie>"
+    );
+  }
+  if (cookie.length > 8000) {
+    return sendTelegramMessage(chatId, `Cookie 过长（${cookie.length} 字符），请检查是否复制了多余内容。`);
+  }
+  const res = await tgApiJson("/api/bot/quark-cookie", {
+    method: "POST",
+    body: JSON.stringify({ cookie }),
+  });
+  if (!res.ok) return sendTelegramMessage(chatId, mapTgError(res));
+  const lines = [
+    `夸克 Cookie 已更新（长度 ${cookie.length} 字符），之后所有下载任务自动使用新 Cookie。`,
+  ];
+  const pending = lastDispatch.get(chatId);
+  if (pending) {
+    const resp = await dispatchDownload(pending.url, chatId, pending.folder);
+    if (resp.ok) {
+      lastDispatch.delete(chatId);
+      lines.push("正在自动重试上次未完成的下载任务，完成后会回报。");
+    } else {
+      lines.push("自动重试提交失败，可稍后发 /retry 或直接重发链接。");
+    }
+  } else {
+    lines.push("本会话没有待重试的下载任务。");
+  }
+  await sendTelegramMessage(chatId, lines.join("\n"));
+}
+
+// /retry：重派本会话最近一次下载任务（补完 Cookie 后 /setcookie 会自动做，也可手动）。
+async function cmdRetry(chatId) {
+  const pending = lastDispatch.get(chatId);
+  if (!pending) {
+    return sendTelegramMessage(
+      chatId,
+      "本会话没有记录到待重试的下载任务（bot 重启后记录会清空，直接重发链接即可）。"
+    );
+  }
+  const resp = await dispatchDownload(pending.url, chatId, pending.folder);
+  if (resp.ok) {
+    lastDispatch.delete(chatId);
+    return sendTelegramMessage(chatId, "已重新提交上次未完成的下载任务，完成后会回报。");
+  }
+  return sendTelegramMessage(chatId, mapTgError(resp));
+}
+
 async function cmdRmdir(chatId, args) {
   const raw = args.trim();
 
@@ -517,6 +582,8 @@ const COMMANDS = {
   rename: cmdRename,
   rm: cmdRm,
   rmdir: cmdRmdir,
+  setcookie: cmdSetCookie,
+  retry: cmdRetry,
 };
 
 async function handleCommand(chatId, text) {
@@ -663,6 +730,7 @@ async function handleUpdate(update) {
       continue;
     }
     if (resp.ok) {
+      lastDispatch.set(chatId, { url, folder });
       submitted.push(url);
       continue;
     }
