@@ -79,8 +79,10 @@ if grep -q "fn max_upload_body_size" src/constants.rs \
   && grep -q "fn require_bot_key" src/routes/api_bot.rs \
   && grep -q "fn panel_router" src/routes/api_bot.rs \
   && grep -q "/api/folders" src/routes/api_bot.rs \
-  && grep -q "folder-grid" app/templates/index.html; then
-  echo "==> 自检通过：10GiB 上限 + flood 变体重试 + 全局闸 + 文件夹/bot 管理面 + 网页目录管理"
+  && grep -q "folder-grid" app/templates/index.html \
+  && grep -q "fn kv_set" src/database.rs \
+  && grep -q "quark-cookie" src/routes/api_bot.rs; then
+  echo "==> 自检通过：10GiB 上限 + flood 变体重试 + 全局闸 + 文件夹/bot 管理面 + 网页目录管理 + Cookie 存储"
 else
   echo "==> 自检失败：补丁未正确生效" >&2
   exit 1
