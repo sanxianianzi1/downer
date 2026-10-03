@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 让 tgstate-rust 带上「上传上限 10GiB」补丁，并构建启动。
+# 让 tgstate-rust 带上本仓库的全部补丁，并构建启动。
 #
 # 什么时候用：
 #   - VPS 重装 / 换机器 / 换了部署目录
@@ -11,17 +11,16 @@
 #   ./setup-tgstate-rust.sh --prep   只准备代码，不构建
 #
 # 背景：tgstate-rust/ 是上游克隆，被 .gitignore 排除，不进本仓库。
-#       本脚本负责把它拉下来并打上补丁，补丁见 patches/。
+#       本脚本负责把它拉下来并按文件名顺序打上 patches/ 里的全部补丁。
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 DIR=tgstate-rust
 BASE=bf4253a5dcd686b63cf589fc8c24df7f73d2a4a6   # 上游 v2.1.7
-PATCHFILE=patches/tgstate-rust-10gib-body-limit.patch
 
-if [ ! -f "$PATCHFILE" ]; then
-  echo "找不到补丁 $PATCHFILE" >&2
+if ! ls patches/*.patch >/dev/null 2>&1; then
+  echo "找不到 patches/ 下的补丁" >&2
   exit 1
 fi
 
@@ -40,20 +39,27 @@ echo "==> 切到基线 $BASE (v2.1.7)"
 git fetch --tags --quiet origin || true
 git checkout --quiet "$BASE"
 
-# 3. 打补丁（可重复执行）
-if grep -q "fn max_upload_body_size" src/constants.rs; then
-  echo "==> 补丁已在位，跳过"
-elif git apply --check "../$PATCHFILE" 2>/dev/null; then
-  git apply "../$PATCHFILE"
-  echo "==> 补丁已应用"
-else
-  echo "==> 补丁无法应用，请人工检查（上游代码可能已变动）" >&2
-  exit 1
-fi
+# 3. 按文件名顺序打全部补丁（可重复执行）
+#    「已在位」用反向应用检测：补丁已生效时 forward check 会失败、reverse check 成功。
+for pf in ../patches/*.patch; do
+  name=$(basename "$pf")
+  if git apply --reverse --check "$pf" 2>/dev/null; then
+    echo "==> $name 已在位，跳过"
+  elif git apply --check "$pf" 2>/dev/null; then
+    git apply "$pf"
+    echo "==> 已应用 $name"
+  else
+    echo "==> $name 无法应用，请人工检查（上游代码可能已变动）" >&2
+    exit 1
+  fi
+done
 
 # 4. 自检
-if grep -q "fn max_upload_body_size" src/constants.rs && grep -q "max_upload_body_size()" src/main.rs; then
-  echo "==> 自检通过：上传上限 10GiB（可用 MAX_UPLOAD_BODY_SIZE_MB 覆盖）"
+if grep -q "fn max_upload_body_size" src/constants.rs \
+  && grep -q "max_upload_body_size()" src/main.rs \
+  && grep -q 'contains("too many requests")' src/telegram/service.rs \
+  && grep -q "fn global_upload_semaphore" src/telegram/service.rs; then
+  echo "==> 自检通过：10GiB 上限 + 400 flood 变体识别重试 + 全局上传串行闸"
 else
   echo "==> 自检失败：补丁未正确生效" >&2
   exit 1
