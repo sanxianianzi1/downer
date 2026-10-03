@@ -68,7 +68,7 @@ workflow 必须在仓库**默认分支**。GitHub 上只放代码，不要提交
 | `BOT_TOKEN` | **下载 Bot** 的 Token（把结果发回会话） |
 | `RCLONE_CONF` | 可选，本机 `rclone.conf` 全文（含 remote 段，不要提交到仓库）。留空则跳过转存 |
 | `RCLONE_DEST` | 可选，rclone 目标，如 `remote2:downloads`（可放 Actions Variables，也可放 Secrets）。留空则跳过转存 |
-| `GOPEED_COOKIE` | 可选，下载所需 Cookie，如 `session=abc; token=xyz`（不要提交到仓库） |
+| `GOPEED_COOKIE` | 可选兜底 Cookie（推荐改用 TG `/setcookie`，见 Cookie 维护节）|
 | `GOPEED_HEADERS` | 可选，额外 HTTP 头，每行 `Name: value`，如 `User-Agent: ...` |
 
 再创建 **GitHub PAT**（Bot 用它触发 workflow）：
@@ -81,7 +81,17 @@ workflow 必须在仓库**默认分支**。GitHub 上只放代码，不要提交
 
 `RCLONE_CONF` 与 `RCLONE_DEST` 的写法见下面「rclone 转存」。
 
-需要登录态才能下的直链：把 Cookie 放进 Secret `GOPEED_COOKIE`。取法：浏览器登录目标站后，F12 打开开发者工具 -> Network -> 随便点一个请求 -> Request Headers 里的 `Cookie:` 整段复制（不要带 `Cookie:` 前缀）。Cookie 过期后重新取一次。
+## Cookie 维护（推荐用 /setcookie）
+
+需要登录态才能下的直链（如夸克）要带 Cookie。**推荐流程**：在 TG 里发给机器人
+`/setcookie <Cookie整串>`——Cookie 存入 VPS 的 tgstate 数据库，之后每次下载任务
+开始时 workflow 自动取最新的用，无需再碰 GitHub Secret。
+`/setcookie` 成功后会自动重试最近一次未完成的下载任务；也可用 `/retry` 手动重试。
+
+取 Cookie：浏览器登录 pan.quark.cn → F12 开发者工具 → Network → 随便点一个请求
+→ Request Headers 里 `Cookie:` 整段复制（不带前缀）。
+
+Secret `GOPEED_COOKIE` 降级为兜底：数据库里没设 Cookie 时才用它。
 
 Gopeed CLI 本身不收 Cookie，workflow 改用官方 gopeed-web 二进制起本地 REST API，创建任务时把该 Secret 写进 `req.extra.header.Cookie`。magnet / ed2k 不使用 Cookie。还要伪装浏览器时，把额外请求头逐行放进 `GOPEED_HEADERS`（每行 `Name: value`）。
 
@@ -246,7 +256,7 @@ docker compose up -d --build
 | 分享安全 | 短链即访问凭据，私密文件在 tgstate 网页给该文件设分享密码 |
 | 两个 Bot | 下载 Bot 与网盘 Bot 必须分开，不能共用 Token |
 | rclone | Secret `RCLONE_CONF` + `RCLONE_DEST`；下载完成后 `rclone copy work <目标>` |
-| Cookie | Secret `GOPEED_COOKIE`（可选 `GOPEED_HEADERS`）；http/https 直链下载时带上 |
+| Cookie | 优先 tgstate 数据库（bot `/setcookie` 设置，workflow 实时拉取）；未设置时回落 Secret `GOPEED_COOKIE`（可选 `GOPEED_HEADERS`）|
 ## 故障排查
 
 | 现象 | 原因与处理 |
@@ -257,7 +267,7 @@ docker compose up -d --build
 | 「任务提交失败：422」 | workflow 未在默认分支，或 event 名不是 `download-task` |
 | Actions 登录网盘失败 | `TGSTATE_URL` / `TGSTATE_PASSWORD` 错误；URL 结尾不要 `/` |
 | rclone copy 失败 | `RCLONE_CONF` 不是 conf 全文，或 `RCLONE_DEST` 远端名与 conf 里的 `[remote]` 对不上 |
-| 直链 403 / 需要登录 | 补 Secret `GOPEED_COOKIE`，内容为浏览器该站 Cookie；过期后重新粘贴 |
+| 直链 403 / 需要登录 | TG 发 `/setcookie <浏览器Cookie>`（自动重试）；或兜底补 Secret `GOPEED_COOKIE` |
 | tgstate 提示缺 Bot/频道 | 网页设置里填的是网盘 Bot，不是下载 Bot |
 | 网页登录后立刻掉线 | HTTPS 反代时设置 `COOKIE_SECURE=1` |
 | 频道不同步新文件 | 网盘 Bot 与下载 Bot 共用了 Token，拆成两个 |
