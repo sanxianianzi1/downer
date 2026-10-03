@@ -171,6 +171,10 @@ jobs:
                 ;;
               error)
                 echo "::error::Gopeed 下载失败"
+                err=$(jq -c '{detail: .data.detail, errMsg: .data.errMsg, error: .data.error}' <<<"$resp" 2>/dev/null || true)
+                if [ -n "$err" ] && [ "$err" != '{"detail":null,"errMsg":null,"error":null}' ]; then
+                  echo "Gopeed 错误详情: $err"
+                fi
                 exit 1
                 ;;
             esac
