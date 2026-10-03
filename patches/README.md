@@ -99,18 +99,19 @@ axum 的 `DefaultBodyLimit` 在**读取请求体阶段**就中断连接，早于
 与 bot 管理面共用同一套 `folders` 数据，两端互通。
 
 - 基线：上游 `bf4253a`（v2.1.7）+ 前三个补丁
-- 改动：`src/routes/api_bot.rs`（+94）、`src/database.rs`（+11）、
-  `src/routes/mod.rs`（+1）、`app/templates/index.html`、`app/static/js/main.js`（+255）、
-  `app/static/css/style.css`（+94）
+- 改动：`src/routes/api_bot.rs`（+94）、`src/database.rs`（+60）、
+  `src/routes/pages.rs`（+32）、`src/routes/mod.rs`（+1）、
+  `app/templates/index.html`、`app/static/js/main.js`、`app/static/css/style.css`
 - 无新增环境变量、无新增数据库迁移（复用第三补丁的 `folders` 表）
 
 ### 功能（网页 · 文件管理页）
 
-- 面包屑导航 + 目录卡片网格：点击进入子目录，点面包屑回退
-- 「+ 新建目录」：在当前目录下创建
-- 目录卡片：改名、删除（级联确认后真删，TG 无回收站）
-- 文件行新增「移动到目录」「改名」按钮
-- 移动支持路径语义：`/` = 根目录，`/影视/2026` = 逐层目录（服务端解析，与 bot 的 /mv 一致）
+- 面包屑导航 + 目录卡片，全部**服务端渲染**（`/?folder_id=N` 纯链接跳转），
+  浏览器缓存 / JS 失效都不影响目录浏览
+- 「+ 新建目录」在当前目录下创建；目录卡片可改名、删除（级联确认后真删，TG 无回收站）
+- 文件行有「移动」「改名」按钮；移动输入路径（`/` = 根，`/影视/2026` = 逐层目录，
+  服务端解析，与 bot 的 /mv 一致）；文件列表只显示当前目录直属文件
+- 两边改动实时互通：Bot 里 /mkdir 建的目录网页立刻可见，反之亦然
 
 ### API（复用 bot 的 handler，走面板会话鉴权，未登录 401）
 
@@ -125,13 +126,15 @@ axum 的 `DefaultBodyLimit` 在**读取请求体阶段**就中断连接，早于
 
 handler 在 `api_bot.rs` 内与 `/api/bot/*` 共用（单一实现两处挂载），
 面板路由不挂 X-Bot-Key 层，由全局会话中间件保护。
-`/api/files` 与列表接口的文件对象新增 `folder_id` 字段。
+首页 SSR（`/?folder_id=N`）与 `/api/files` 的文件对象均带 `folder_id`
+（`pages.rs` 的 `enrich_files` 必须透传该键，模板 `{{ f.folder_id }}`
+缺键会让 Tera 渲染失败返回 500——这是历史坑，勿删）。
 
 ### 注意
 
-- 页面刷新后目录视图从根目录开始（SSR 仍渲染全量列表，JS 加载后覆盖为根目录视图）
+- 目录导航是纯链接（SSR），CRUD 操作后 `location.reload()` 刷新视图
 - 搜索框仅过滤当前目录视图内的行
-- 部署后浏览器需强刷（模板版本号已升到 `?v=5.6`）
+- 部署后浏览器需强刷（模板版本号已升到 `?v=5.7`）
 
 ### 验证
 
